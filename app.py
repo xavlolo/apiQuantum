@@ -12,6 +12,16 @@ from plotly.subplots import make_subplots
 import joblib
 import os
 import sklearn
+
+# Page configuration MUST BE FIRST ST COMMAND!
+st.set_page_config(
+    page_title="Quantum FFT State Analyzer",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# NOW you can use other st commands
 st.sidebar.text(f"sklearn: {sklearn.__version__}")
 
 # In the status bar at the bottom
@@ -20,15 +30,6 @@ with st.sidebar:
         st.text(f"sklearn: {sklearn.__version__}")
         st.text(f"numpy: {np.__version__}")
         st.text(f"pandas: {pd.__version__}")
-
-# Page configuration
-st.set_page_config(
-    page_title="Quantum FFT State Analyzer",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
 # Custom CSS for better styling
 st.markdown("""
     <style>
