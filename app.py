@@ -11,6 +11,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import joblib
 import os
+import sklearn
+st.sidebar.text(f"sklearn: {sklearn.__version__}")
+
+# In the status bar at the bottom
+with st.sidebar:
+    with st.expander("System Info"):
+        st.text(f"sklearn: {sklearn.__version__}")
+        st.text(f"numpy: {np.__version__}")
+        st.text(f"pandas: {pd.__version__}")
 
 # Page configuration
 st.set_page_config(
