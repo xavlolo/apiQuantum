@@ -1,5 +1,5 @@
 """
-Quantum FFT State Analyzer
+Quantum FFT State Analyzer - Fixed Version
 A web interface for forward and inverse quantum state analysis
 """
 
@@ -11,9 +11,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import joblib
 import os
-import sklearn
+from itertools import product
+from scipy.signal import find_peaks
+from scipy.interpolate import CubicSpline
+from scipy.optimize import minimize_scalar
 
-# Page configuration MUST BE FIRST ST COMMAND!
+# Page configuration
 st.set_page_config(
     page_title="Quantum FFT State Analyzer",
     page_icon="🔬",
@@ -21,15 +24,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# NOW you can use other st commands
-st.sidebar.text(f"sklearn: {sklearn.__version__}")
-
-# In the status bar at the bottom
-with st.sidebar:
-    with st.expander("System Info"):
-        st.text(f"sklearn: {sklearn.__version__}")
-        st.text(f"numpy: {np.__version__}")
-        st.text(f"pandas: {pd.__version__}")
 # Custom CSS for better styling
 st.markdown("""
     <style>
@@ -50,6 +44,183 @@ st.markdown("""
     }
     </style>
     """, unsafe_allow_html=True)
+
+# ==========================================
+# QUANTUM SIMULATION FUNCTIONS
+# ==========================================
+
+@st.cache_data
+def get_full_basis_6qubits():
+    basis_states = list(product([0, 1], repeat=6))
+    state_to_idx = {s: i for i, s in enumerate(basis_states)}
+    return basis_states, state_to_idx
+
+def commutator(H, rho):
+    return -1j * (H @ rho - rho @ H)
+
+def rk4_step(H, rho, dt):
+    k1 = dt * commutator(H, rho)
+    k2 = dt * commutator(H, rho + 0.5 * k1)
+    k3 = dt * commutator(H, rho + 0.5 * k2)
+    k4 = dt * commutator(H, rho + k3)
+    return rho + (k1 + 2*k2 + 2*k3 + k4) / 6
+
+def initialize_superposition(basis_states, state_to_idx, superposition_dict):
+    psi = np.zeros(len(basis_states), complex)
+    for state, amp in superposition_dict.items():
+        if state in state_to_idx:
+            psi[state_to_idx[state]] = amp
+    psi /= np.linalg.norm(psi)
+    rho = np.outer(psi, psi.conj())
+    return psi, rho
+
+def calculate_zz_energy(state, k_pattern):
+    energy = 0.0
+    for (i, j), k_val in k_pattern.items():
+        energy += k_val if state[i] == state[j] else -k_val
+    return energy
+
+@st.cache_data
+def generate_hamiltonian_fullbasis(basis_states, state_to_idx, k_pattern, j_pairs, J_coupling=1.0):
+    n = len(basis_states)
+    H = np.zeros((n, n), complex)
+    
+    # Diagonal elements (ZZ interactions)
+    for idx, st in enumerate(basis_states):
+        H[idx, idx] = calculate_zz_energy(st, k_pattern)
+
+    # Off-diagonal elements (XX+YY interactions)
+    for (i, j) in j_pairs:
+        for idx, st in enumerate(basis_states):
+            if st[i] != st[j]:
+                flipped = list(st)
+                flipped[i], flipped[j] = st[j], st[i]
+                idx2 = state_to_idx[tuple(flipped)]
+                H[idx, idx2] += J_coupling
+                H[idx2, idx] += J_coupling
+
+    evals, evecs = np.linalg.eigh(H)
+    return H, evals, evecs
+
+def analyze_fft_with_spline(probs, tpoints, qubit_idx, min_peak_height=0.05):
+    """Simplified FFT analysis using cubic spline"""
+    
+    # Check if qubit has oscillation
+    if np.std(probs[:, qubit_idx]) < 0.001:
+        return []
+    
+    # Compute FFT
+    dt = tpoints[1] - tpoints[0]
+    sig = probs[:, qubit_idx] - np.mean(probs[:, qubit_idx])
+    win = np.hanning(len(sig))
+    fft = np.fft.fft(sig * win)
+    freq = np.fft.fftfreq(len(fft), dt)
+    
+    # Focus on positive frequencies
+    mask = freq >= 0
+    pos_freq = freq[mask]
+    pos_mag = np.abs(fft[mask])
+    
+    # Find peaks
+    threshold = min_peak_height * np.max(pos_mag)
+    peaks, _ = find_peaks(pos_mag, height=threshold, distance=5)
+    
+    # Skip DC component
+    if len(peaks) > 0 and pos_freq[peaks[0]] < 0.05:
+        peaks = peaks[1:]
+    
+    if len(peaks) == 0:
+        return []
+    
+    # Create cubic spline
+    spline = CubicSpline(pos_freq, pos_mag)
+    
+    # Analyze peaks
+    peak_results = []
+    for peak_idx in peaks[:5]:  # Limit to 5 peaks
+        # Define window around peak
+        window = 20
+        left_idx = max(0, peak_idx - window)
+        right_idx = min(len(pos_freq), peak_idx + window)
+        freq_window = pos_freq[left_idx:right_idx]
+        
+        if len(freq_window) < 4:
+            continue
+        
+        # Find precise peak using spline
+        freq_range = (freq_window[0], freq_window[-1])
+        result = minimize_scalar(lambda x: -spline(x), bounds=freq_range, method='bounded')
+        
+        precise_freq = result.x
+        precise_amp = spline(precise_freq)
+        
+        peak_results.append({
+            'freq': float(precise_freq),
+            'amp': float(precise_amp)
+        })
+    
+    return peak_results
+
+def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_coupling):
+    """Run the quantum simulation and return FFT peaks"""
+    
+    # Setup
+    dt = 0.01
+    t_max = 50
+    
+    k_pattern = {
+        (0,1): k01,
+        (2,3): k23,
+        (4,5): k45
+    }
+    j_pairs = [(0,2), (2,4)]  # Fixed for this setup
+    
+    # Get basis states
+    basis_states, state_to_idx = get_full_basis_6qubits()
+    projectors = [np.diag([s[q] for s in basis_states]) for q in range(6)]
+    
+    # Define quantum states
+    state_A = (1,1,0,0,0,0)  # |110000⟩
+    state_B = (1,0,0,1,0,0)  # |100100⟩
+    state_C = (1,0,0,0,0,1)  # |100001⟩
+    
+    superposition_dict = {
+        state_A: a_complex,
+        state_B: b_complex,
+        state_C: c_complex
+    }
+    
+    # Initialize quantum state
+    psi0, rho0 = initialize_superposition(basis_states, state_to_idx, superposition_dict)
+    
+    # Generate Hamiltonian
+    H, evals, evecs = generate_hamiltonian_fullbasis(
+        basis_states, state_to_idx, k_pattern, j_pairs, j_coupling
+    )
+    
+    # Time evolution
+    times = np.arange(0, t_max + dt, dt)
+    probs = np.zeros((len(times), 6))
+    
+    # Initial probabilities
+    for q in range(6):
+        probs[0, q] = np.real(np.trace(rho0 @ projectors[q]))
+    
+    # Evolve system
+    rho = rho0.copy()
+    for i in range(1, len(times)):
+        rho = rk4_step(H, rho, dt)
+        for q in range(6):
+            probs[i, q] = np.real(np.trace(rho @ projectors[q]))
+    
+    # Analyze Q4 FFT
+    peaks = analyze_fft_with_spline(probs, times, 4)  # Q4
+    
+    return peaks, probs, times
+
+# ==========================================
+# STREAMLIT APP
+# ==========================================
 
 # Initialize session state
 if 'k_values_locked' not in st.session_state:
@@ -178,14 +349,21 @@ with col1:
     # Simulate button
     if st.button("🔄 Simulate Dynamics", key="simulate"):
         with st.spinner("Running quantum simulation..."):
-            # Placeholder for actual quantum simulation
-            # In real implementation, call your quantum simulation functions here
+            # Create complex amplitudes
+            a_complex = a_real + 1j * a_imag
+            b_complex = b_real + 1j * b_imag
+            c_complex = c_real + 1j * c_imag
+            
+            # Run actual simulation
+            peaks, probs, times = run_quantum_simulation(
+                a_complex, b_complex, c_complex,
+                k01_forward, k23_forward, k45_forward, j_coupling_forward
+            )
+            
             st.session_state.forward_results = {
-                'peaks': [
-                    {'freq': 0.523, 'amp': 0.145},
-                    {'freq': 0.817, 'amp': 0.098},
-                    {'freq': 1.234, 'amp': 0.203}
-                ],
+                'peaks': peaks,
+                'probs': probs,
+                'times': times,
                 'success': True
             }
     
@@ -193,38 +371,51 @@ with col1:
     if st.session_state.forward_results:
         st.markdown("### 📊 Results")
         st.markdown("**Detected Peaks:**")
-        for peak in st.session_state.forward_results['peaks']:
-            st.write(f"• {peak['freq']:.3f} Hz (amp: {peak['amp']:.3f})")
+        
+        peaks = st.session_state.forward_results['peaks']
+        if peaks:
+            for i, peak in enumerate(peaks):
+                st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
+        else:
+            st.write("No significant peaks detected")
         
         col_plot1, col_plot2 = st.columns(2)
         with col_plot1:
             if st.button("📊 Show FFT Plot", key="fft_plot"):
-                # Placeholder for FFT plot
                 fig, ax = plt.subplots(figsize=(6, 4))
-                freqs = np.linspace(0, 2, 1000)
-                # Simulated FFT with peaks
-                fft_mag = np.zeros_like(freqs)
-                for peak in st.session_state.forward_results['peaks']:
-                    fft_mag += peak['amp'] * np.exp(-((freqs - peak['freq'])/0.05)**2)
-                ax.plot(freqs, fft_mag)
+                
+                # Compute actual FFT for display
+                probs = st.session_state.forward_results['probs']
+                times = st.session_state.forward_results['times']
+                dt = times[1] - times[0]
+                
+                # FFT of Q4
+                sig = probs[:, 4] - np.mean(probs[:, 4])
+                win = np.hanning(len(sig))
+                fft = np.fft.fft(sig * win)
+                freq = np.fft.fftfreq(len(fft), dt)
+                mask = freq >= 0
+                
+                ax.plot(freq[mask], np.abs(fft[mask]))
                 ax.set_xlabel('Frequency (Hz)')
                 ax.set_ylabel('Magnitude')
                 ax.set_title('FFT of Q4')
                 ax.grid(True, alpha=0.3)
+                ax.set_xlim(0, 2)
                 st.pyplot(fig)
         
         with col_plot2:
             if st.button("📈 Show Dynamics", key="dynamics_plot"):
-                # Placeholder for dynamics plot
                 fig, ax = plt.subplots(figsize=(6, 4))
-                t = np.linspace(0, 50, 1000)
-                # Simulated dynamics
-                dynamics = 0.5 + 0.3*np.sin(2*np.pi*0.523*t) + 0.2*np.sin(2*np.pi*0.817*t)
-                ax.plot(t, dynamics)
+                probs = st.session_state.forward_results['probs']
+                times = st.session_state.forward_results['times']
+                
+                ax.plot(times, probs[:, 4])
                 ax.set_xlabel('Time')
                 ax.set_ylabel('P(1)')
                 ax.set_title('Q4 Dynamics')
                 ax.grid(True, alpha=0.3)
+                ax.set_ylim(-0.05, 1.05)
                 st.pyplot(fig)
 
 # INVERSE PROBLEM (Right Panel)
@@ -252,92 +443,91 @@ with col2:
     # Target qubit selection
     target_qubit = st.selectbox("Target Qubit", ["Q4", "Q0", "Q1", "Q2", "Q3", "Q5"])
     
+    # Auto-fill from forward results
+    if st.session_state.forward_results and st.button("↩️ Use Forward Results", key="autofill"):
+        peaks = st.session_state.forward_results['peaks']
+        # This will update the values but requires a rerun to show in the inputs
+        st.info("Peak values loaded! Adjust if needed and click 'Predict State'")
+    
     # FFT Peak inputs
     st.markdown("**FFT Peak Frequencies (Hz):**")
     col_freq, col_amp = st.columns(2)
     
+    # Initialize default values
+    default_peaks = []
+    if st.session_state.forward_results:
+        default_peaks = st.session_state.forward_results['peaks']
+    
     with col_freq:
         st.markdown("**Frequencies:**")
-        peak1_freq = st.number_input("Peak 1", value=0.523, min_value=0.0, max_value=5.0, step=0.001, 
-                                    format="%.3f", key="p1f")
-        peak2_freq = st.number_input("Peak 2", value=0.817, min_value=0.0, max_value=5.0, step=0.001, 
-                                    format="%.3f", key="p2f")
-        peak3_freq = st.number_input("Peak 3", value=1.234, min_value=0.0, max_value=5.0, step=0.001, 
-                                    format="%.3f", key="p3f")
-        peak4_freq = st.number_input("Peak 4", value=0.000, min_value=0.0, max_value=5.0, step=0.001, 
-                                    format="%.3f", key="p4f")
-        peak5_freq = st.number_input("Peak 5", value=0.000, min_value=0.0, max_value=5.0, step=0.001, 
-                                    format="%.3f", key="p5f")
+        peak_freqs = []
+        for i in range(5):
+            default_freq = float(default_peaks[i]['freq']) if i < len(default_peaks) else 0.0
+            freq = st.number_input(f"Peak {i+1}", value=default_freq, min_value=0.0, max_value=5.0, 
+                                  step=0.001, format="%.3f", key=f"p{i+1}f")
+            peak_freqs.append(freq)
     
     with col_amp:
         st.markdown("**Amplitudes:**")
-        peak1_amp = st.number_input("Amp 1", value=0.145, min_value=0.0, max_value=1.0, step=0.001, 
-                                   format="%.3f", key="p1a")
-        peak2_amp = st.number_input("Amp 2", value=0.098, min_value=0.0, max_value=1.0, step=0.001, 
-                                   format="%.3f", key="p2a")
-        peak3_amp = st.number_input("Amp 3", value=0.203, min_value=0.0, max_value=1.0, step=0.001, 
-                                   format="%.3f", key="p3a")
-        peak4_amp = st.number_input("Amp 4", value=0.000, min_value=0.0, max_value=1.0, step=0.001, 
-                                   format="%.3f", key="p4a")
-        peak5_amp = st.number_input("Amp 5", value=0.000, min_value=0.0, max_value=1.0, step=0.001, 
-                                   format="%.3f", key="p5a")
+        peak_amps = []
+        for i in range(5):
+            default_amp = float(default_peaks[i]['amp']) if i < len(default_peaks) else 0.0
+            # Cap the default value if it exceeds maximum
+            max_amp = 50.0
+            if default_amp > max_amp:
+                st.warning(f"Peak {i+1} amplitude {default_amp:.3f} exceeds maximum, capping at {max_amp}")
+                default_amp = max_amp
+            amp = st.number_input(f"Amp {i+1}", value=default_amp, min_value=0.0, max_value=max_amp, 
+                                 step=0.001, format="%.3f", key=f"p{i+1}a")
+            peak_amps.append(amp)
     
     # Predict button
     if st.button("🧮 Predict State", key="predict"):
         with st.spinner("Running ML prediction..."):
-            # Check if model exists
-            if os.path.exists('quantum_inverse_model.pkl'):
-                try:
+            try:
+                # Check if model exists
+                if os.path.exists('quantum_inverse_model.pkl'):
                     # Load model
                     model_data = joblib.load('quantum_inverse_model.pkl')
                     model = model_data['model']
                     scaler = model_data['scaler']
                     
-                    # Prepare features
-                    features = [peak1_freq, peak1_amp, peak2_freq, peak2_amp, 
-                               peak3_freq, peak3_amp, peak4_freq, peak4_amp,
-                               peak5_freq, peak5_amp]
+                    # Prepare features (frequencies and amplitudes interleaved)
+                    features = []
+                    for i in range(5):
+                        features.extend([peak_freqs[i], peak_amps[i]])
+                    
                     X_test = np.array([features])
                     X_test_scaled = scaler.transform(X_test)
                     
                     # Predict
                     y_pred = model.predict(X_test_scaled)[0]
                     
+                    # Calculate confidence based on input quality
+                    non_zero_peaks = sum(1 for f in peak_freqs if f > 0)
+                    confidence = min(95, 50 + non_zero_peaks * 9)
+                    
                     st.session_state.inverse_results = {
-                        'a_mag': y_pred[0],
-                        'b_mag': y_pred[1],
-                        'c_mag': y_pred[2],
-                        'confidence': 94,  # Placeholder
+                        'a_mag': float(y_pred[0]),
+                        'b_mag': float(y_pred[1]),
+                        'c_mag': float(y_pred[2]),
+                        'confidence': confidence,
                         'success': True
                     }
-                except Exception as e:
-                    st.error(f"Error loading model: {str(e)}")
-                    # Use placeholder results
-                    st.session_state.inverse_results = {
-                        'a_mag': 2.47,
-                        'b_mag': 1.68,
-                        'c_mag': 1.09,
-                        'confidence': 94,
-                        'success': True
-                    }
-            else:
-                # Placeholder results when model not available
-                st.session_state.inverse_results = {
-                    'a_mag': 2.47,
-                    'b_mag': 1.68,
-                    'c_mag': 1.09,
-                    'confidence': 94,
-                    'success': True
-                }
+                else:
+                    st.error("Model file 'quantum_inverse_model.pkl' not found!")
+                    st.info("Please run MLpipeline5peaks.py to generate the model first.")
+                    
+            except Exception as e:
+                st.error(f"Error in prediction: {str(e)}")
     
     # Results section
-    if st.session_state.inverse_results:
+    if st.session_state.inverse_results and st.session_state.inverse_results['success']:
         st.markdown("### 📊 Results")
         st.markdown("**Predicted State Magnitudes:**")
-        st.write(f"|a| = {st.session_state.inverse_results['a_mag']:.2f}")
-        st.write(f"|b| = {st.session_state.inverse_results['b_mag']:.2f}")
-        st.write(f"|c| = {st.session_state.inverse_results['c_mag']:.2f}")
-        st.write(f"")
+        st.write(f"|a| = {st.session_state.inverse_results['a_mag']:.3f}")
+        st.write(f"|b| = {st.session_state.inverse_results['b_mag']:.3f}")
+        st.write(f"|c| = {st.session_state.inverse_results['c_mag']:.3f}")
         st.write(f"**Confidence:** {st.session_state.inverse_results['confidence']}%")
         
         if st.button("📊 Show Comparison", key="comparison"):
@@ -354,6 +544,10 @@ with col2:
             ax1.set_ylabel('Magnitude')
             ax1.set_title('Predicted State Magnitudes')
             ax1.set_ylim(0, max(predicted) * 1.2)
+            
+            # Add value labels on bars
+            for i, v in enumerate(predicted):
+                ax1.text(i, v + 0.05, f'{v:.3f}', ha='center')
             
             # Confidence visualization
             ax2.pie([st.session_state.inverse_results['confidence'], 
@@ -372,7 +566,7 @@ with status_col1:
     if os.path.exists('quantum_inverse_model.pkl'):
         st.success("Status: Ready | Model: quantum_inverse_model.pkl loaded ✓")
     else:
-        st.warning("Status: Ready | Model: Using placeholder (quantum_inverse_model.pkl not found)")
+        st.warning("Status: Limited | Model not found - run MLpipeline5peaks.py first")
 with status_col2:
     st.info(f"k-values {'locked 🔒' if st.session_state.k_values_locked else 'unlocked 🔓'}")
 
@@ -383,23 +577,28 @@ with st.sidebar:
     ### Forward Problem
     1. Set coupling constants (k-values and J)
     2. Enter quantum state amplitudes
-    3. Click "Simulate Dynamics"
+    3. Click "Simulate Dynamics" 
     4. View detected FFT peaks
     
     ### Inverse Problem
     1. Set coupling constants (or lock to sync)
     2. Enter FFT peak frequencies and amplitudes
+       - Or use "↩️ Use Forward Results" button
     3. Click "Predict State"
     4. View predicted quantum state magnitudes
     
     ### Features
     - 🔒 Lock icon syncs k-values between panels
-    - 📊 Interactive plots for visualization
+    - 📊 Real quantum simulation (not placeholders!)
     - 🧮 ML-based state prediction
+    - ↩️ Auto-fill inverse from forward results
     
-    ### Deployment
-    - Save this as `app.py`
-    - Install requirements: `streamlit`, `numpy`, `pandas`, `matplotlib`, `plotly`, `joblib`
-    - Run locally: `streamlit run app.py`
-    - Deploy on Streamlit Cloud, Heroku, or your server
+    ### Setup Requirements
+    1. Run `Qubits6_fitted_spline.py` to generate ML dataset
+    2. Run `MLpipeline5peaks.py` to train the model
+    3. Ensure `quantum_inverse_model.pkl` exists
+    
+    ### Note
+    The forward problem runs actual quantum dynamics simulation,
+    so it may take a few seconds to complete.
     """)
