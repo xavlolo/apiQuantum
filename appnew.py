@@ -1,5 +1,5 @@
 """
-Quantum FFT State Analyzer - Fixed Version
+Quantum FFT State Analyzer - Fixed Complete Version
 A web interface for forward and inverse quantum state analysis
 """
 
@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 import joblib
 import os
 from itertools import product
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, peak_widths
 from scipy.interpolate import CubicSpline
 from scipy.optimize import minimize_scalar
 
@@ -41,6 +41,19 @@ st.markdown("""
         padding: 20px;
         border-radius: 10px;
         margin-top: 20px;
+    }
+    .magnitude-display {
+        background-color: #e3f2fd;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 5px 0;
+        font-weight: bold;
+    }
+    .phase-display {
+        background-color: #fff3e0;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 5px 0;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -102,12 +115,25 @@ def generate_hamiltonian_fullbasis(basis_states, state_to_idx, k_pattern, j_pair
     evals, evecs = np.linalg.eigh(H)
     return H, evals, evecs
 
-def analyze_fft_with_spline(probs, tpoints, qubit_idx, min_peak_height=0.05):
-    """Simplified FFT analysis using cubic spline"""
+def analyze_fft_with_peak_fitting(probs, tpoints, qubit_idx, 
+                                 min_peak_height=0.1,
+                                 peak_type='lorentzian',  # Keep for compatibility
+                                 fit_window_factor=5,     # Keep for compatibility
+                                 plot_results=False):
+    """
+    Simplified FFT analysis using ONLY CubicSpline - matches training code
+    """
     
-    # Check if qubit has oscillation
+    # Check if qubit has any oscillation
     if np.std(probs[:, qubit_idx]) < 0.001:
-        return []
+        empty_freq = np.linspace(0, 1, 100)
+        empty_mag = np.zeros_like(empty_freq)
+        return {
+            'raw_fft': (empty_freq, empty_mag),
+            'peaks': [],
+            'fitted_spectrum': empty_mag,
+            'message': 'No oscillation detected'
+        }
     
     # Compute FFT
     dt = tpoints[1] - tpoints[0]
@@ -125,19 +151,30 @@ def analyze_fft_with_spline(probs, tpoints, qubit_idx, min_peak_height=0.05):
     threshold = min_peak_height * np.max(pos_mag)
     peaks, _ = find_peaks(pos_mag, height=threshold, distance=5)
     
-    # Skip DC component
+    # Skip DC component if present
     if len(peaks) > 0 and pos_freq[peaks[0]] < 0.05:
+        if plot_results:
+            print(f"Skipping DC component at {pos_freq[peaks[0]]:.4f} Hz")
         peaks = peaks[1:]
     
     if len(peaks) == 0:
-        return []
+        if plot_results:
+            print("No significant oscillation peaks found")
+        return {
+            'raw_fft': (pos_freq, pos_mag),
+            'peaks': [],
+            'fitted_spectrum': np.zeros_like(pos_mag)
+        }
     
     # Create cubic spline
     spline = CubicSpline(pos_freq, pos_mag)
+    fitted_spectrum = spline(pos_freq)
     
-    # Analyze peaks
-    peak_results = []
-    for peak_idx in peaks[:5]:  # Limit to 5 peaks
+    # Analyze each peak
+    fitted_peaks = []
+    
+    for peak_idx in peaks:
+        
         # Define window around peak
         window = 20
         left_idx = max(0, peak_idx - window)
@@ -146,20 +183,73 @@ def analyze_fft_with_spline(probs, tpoints, qubit_idx, min_peak_height=0.05):
         
         if len(freq_window) < 4:
             continue
-        
-        # Find precise peak using spline
+            
+        # Find precise peak maximum using spline
         freq_range = (freq_window[0], freq_window[-1])
         result = minimize_scalar(lambda x: -spline(x), bounds=freq_range, method='bounded')
         
         precise_freq = result.x
         precise_amp = spline(precise_freq)
         
-        peak_results.append({
-            'freq': float(precise_freq),
-            'amp': float(precise_amp)
+        # Estimate width by finding half-maximum points
+        half_max = precise_amp / 2
+        
+        # Find left half-maximum
+        left_half = precise_freq
+        for f in np.linspace(freq_window[0], precise_freq, 100):
+            if spline(f) >= half_max:
+                left_half = f
+                break
+        
+        # Find right half-maximum
+        right_half = precise_freq
+        for f in np.linspace(precise_freq, freq_window[-1], 100):
+            if spline(f) < half_max:
+                right_half = f
+                break
+        
+        width = right_half - left_half
+        Q_factor = precise_freq / (2 * width) if width > 0 else np.inf
+        
+        # Calculate integrated intensity (simple approximation)
+        integrated_intensity = precise_amp * width
+        
+        fitted_peaks.append({
+            'frequency': precise_freq,
+            'amplitude': precise_amp,
+            'width': width,
+            'integrated_intensity': integrated_intensity,
+            'Q_factor': Q_factor,
+            'raw_peak_idx': peak_idx,
+            'fit_success': True
         })
     
-    return peak_results
+    # Sort peaks by frequency
+    fitted_peaks.sort(key=lambda x: x['frequency'])
+    
+    # Ensure exactly 5 peaks for ML compatibility
+    while len(fitted_peaks) < 5:
+        fitted_peaks.append({
+            'frequency': 0.0,
+            'amplitude': 0.0,
+            'width': 0.0,
+            'integrated_intensity': 0.0,
+            'Q_factor': 0.0,
+            'raw_peak_idx': -1,
+            'fit_success': False
+        })
+    
+    # Keep only top 5 by amplitude if more than 5
+    if len(fitted_peaks) > 5:
+        fitted_peaks.sort(key=lambda x: x['amplitude'], reverse=True)
+        fitted_peaks = fitted_peaks[:5]
+        fitted_peaks.sort(key=lambda x: x['frequency'])  # Re-sort by frequency
+    
+    return {
+        'raw_fft': (pos_freq, pos_mag),
+        'peaks': fitted_peaks,
+        'fitted_spectrum': fitted_spectrum
+    }
 
 def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_coupling):
     """Run the quantum simulation and return FFT peaks"""
@@ -213,10 +303,23 @@ def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_cou
         for q in range(6):
             probs[i, q] = np.real(np.trace(rho @ projectors[q]))
     
-    # Analyze Q4 FFT
-    peaks = analyze_fft_with_spline(probs, times, 4)  # Q4
+    # Analyze Q4 FFT using the same method as training
+    peak_data = analyze_fft_with_peak_fitting(probs, times, 4, min_peak_height=0.05)
     
-    return peaks, probs, times
+    # Extract peaks in the format expected by the app
+    peaks = []
+    for peak in peak_data['peaks'][:5]:  # Get first 5 peaks
+        if peak['fit_success']:
+            peaks.append({
+                'freq': float(peak['frequency']),
+                'amp': float(peak['amplitude'])
+            })
+    
+    # Ensure we have exactly 5 peaks
+    while len(peaks) < 5:
+        peaks.append({'freq': 0.0, 'amp': 0.0})
+    
+    return peaks[:5], probs, times, peak_data['raw_fft']
 
 # ==========================================
 # STREAMLIT APP
@@ -229,6 +332,8 @@ if 'forward_results' not in st.session_state:
     st.session_state.forward_results = None
 if 'inverse_results' not in st.session_state:
     st.session_state.inverse_results = None
+if 'forward_magnitudes' not in st.session_state:
+    st.session_state.forward_magnitudes = None
 
 # Title and description
 st.title("🔬 Quantum FFT State Analyzer")
@@ -346,16 +451,41 @@ with col1:
         b_imag = st.number_input("b_imag", value=1.368, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
         c_imag = st.number_input("c_imag", value=-2.086, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
     
+    # Calculate and display magnitudes and phases
+    a_complex = a_real + 1j * a_imag
+    b_complex = b_real + 1j * b_imag
+    c_complex = c_real + 1j * c_imag
+    
+    a_mag = abs(a_complex)
+    b_mag = abs(b_complex)
+    c_mag = abs(c_complex)
+    
+    a_phase = np.angle(a_complex, deg=True)
+    b_phase = np.angle(b_complex, deg=True)
+    c_phase = np.angle(c_complex, deg=True)
+    
+    # Store magnitudes in session state
+    st.session_state.forward_magnitudes = {'a': a_mag, 'b': b_mag, 'c': c_mag}
+    
+    # Display magnitudes and phases
+    st.markdown("**Calculated Values:**")
+    col_mag, col_phase = st.columns(2)
+    with col_mag:
+        st.markdown("**Magnitudes:**")
+        st.markdown(f'<div class="magnitude-display">|a| = {a_mag:.3f}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="magnitude-display">|b| = {b_mag:.3f}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="magnitude-display">|c| = {c_mag:.3f}</div>', unsafe_allow_html=True)
+    with col_phase:
+        st.markdown("**Phases (degrees):**")
+        st.markdown(f'<div class="phase-display">φ_a = {a_phase:.1f}°</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="phase-display">φ_b = {b_phase:.1f}°</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="phase-display">φ_c = {c_phase:.1f}°</div>', unsafe_allow_html=True)
+    
     # Simulate button
     if st.button("🔄 Simulate Dynamics", key="simulate"):
         with st.spinner("Running quantum simulation..."):
-            # Create complex amplitudes
-            a_complex = a_real + 1j * a_imag
-            b_complex = b_real + 1j * b_imag
-            c_complex = c_real + 1j * c_imag
-            
             # Run actual simulation
-            peaks, probs, times = run_quantum_simulation(
+            peaks, probs, times, fft_data = run_quantum_simulation(
                 a_complex, b_complex, c_complex,
                 k01_forward, k23_forward, k45_forward, j_coupling_forward
             )
@@ -364,18 +494,20 @@ with col1:
                 'peaks': peaks,
                 'probs': probs,
                 'times': times,
+                'fft_data': fft_data,
                 'success': True
             }
     
     # Results section
-    if st.session_state.forward_results:
+    if st.session_state.forward_results and st.session_state.forward_results['success']:
         st.markdown("### 📊 Results")
         st.markdown("**Detected Peaks:**")
         
         peaks = st.session_state.forward_results['peaks']
         if peaks:
             for i, peak in enumerate(peaks):
-                st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
+                if peak['freq'] > 0:  # Only show non-zero peaks
+                    st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
         else:
             st.write("No significant peaks detected")
         
@@ -384,19 +516,17 @@ with col1:
             if st.button("📊 Show FFT Plot", key="fft_plot"):
                 fig, ax = plt.subplots(figsize=(6, 4))
                 
-                # Compute actual FFT for display
-                probs = st.session_state.forward_results['probs']
-                times = st.session_state.forward_results['times']
-                dt = times[1] - times[0]
+                # Get actual FFT data
+                freq, mag = st.session_state.forward_results['fft_data']
                 
-                # FFT of Q4
-                sig = probs[:, 4] - np.mean(probs[:, 4])
-                win = np.hanning(len(sig))
-                fft = np.fft.fft(sig * win)
-                freq = np.fft.fftfreq(len(fft), dt)
-                mask = freq >= 0
+                ax.plot(freq, mag, 'b-', linewidth=1.5)
                 
-                ax.plot(freq[mask], np.abs(fft[mask]))
+                # Mark peaks
+                for peak in peaks:
+                    if peak['freq'] > 0:
+                        ax.axvline(peak['freq'], color='red', linestyle='--', alpha=0.5)
+                        ax.plot(peak['freq'], peak['amp'], 'ro', markersize=8)
+                
                 ax.set_xlabel('Frequency (Hz)')
                 ax.set_ylabel('Magnitude')
                 ax.set_title('FFT of Q4')
@@ -410,7 +540,7 @@ with col1:
                 probs = st.session_state.forward_results['probs']
                 times = st.session_state.forward_results['times']
                 
-                ax.plot(times, probs[:, 4])
+                ax.plot(times, probs[:, 4], 'b-', linewidth=1.5)
                 ax.set_xlabel('Time')
                 ax.set_ylabel('P(1)')
                 ax.set_title('Q4 Dynamics')
@@ -446,8 +576,7 @@ with col2:
     # Auto-fill from forward results
     if st.session_state.forward_results and st.button("↩️ Use Forward Results", key="autofill"):
         peaks = st.session_state.forward_results['peaks']
-        # This will update the values but requires a rerun to show in the inputs
-        st.info("Peak values loaded! Adjust if needed and click 'Predict State'")
+        st.info("Peak values loaded! See below and click 'Predict State'")
     
     # FFT Peak inputs
     st.markdown("**FFT Peak Frequencies (Hz):**")
@@ -473,7 +602,7 @@ with col2:
         for i in range(5):
             default_amp = float(default_peaks[i]['amp']) if i < len(default_peaks) else 0.0
             # Cap the default value if it exceeds maximum
-            max_amp = 50.0
+            max_amp = 20.0  # More reasonable maximum based on training data
             if default_amp > max_amp:
                 st.warning(f"Peak {i+1} amplitude {default_amp:.3f} exceeds maximum, capping at {max_amp}")
                 default_amp = max_amp
@@ -525,38 +654,122 @@ with col2:
     if st.session_state.inverse_results and st.session_state.inverse_results['success']:
         st.markdown("### 📊 Results")
         st.markdown("**Predicted State Magnitudes:**")
-        st.write(f"|a| = {st.session_state.inverse_results['a_mag']:.3f}")
-        st.write(f"|b| = {st.session_state.inverse_results['b_mag']:.3f}")
-        st.write(f"|c| = {st.session_state.inverse_results['c_mag']:.3f}")
-        st.write(f"**Confidence:** {st.session_state.inverse_results['confidence']}%")
         
-        if st.button("📊 Show Comparison", key="comparison"):
-            # Create comparison plot
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+        # Show predicted magnitudes with comparison to forward values
+        pred_a = st.session_state.inverse_results['a_mag']
+        pred_b = st.session_state.inverse_results['b_mag']
+        pred_c = st.session_state.inverse_results['c_mag']
+        
+        if st.session_state.forward_magnitudes:
+            true_a = st.session_state.forward_magnitudes['a']
+            true_b = st.session_state.forward_magnitudes['b']
+            true_c = st.session_state.forward_magnitudes['c']
             
-            # Bar chart of magnitudes
-            labels = ['|a|', '|b|', '|c|']
-            predicted = [st.session_state.inverse_results['a_mag'],
-                        st.session_state.inverse_results['b_mag'],
-                        st.session_state.inverse_results['c_mag']]
+            # Display with comparison
+            st.markdown("**Magnitude Comparison:**")
+            col_pred, col_true, col_diff = st.columns(3)
             
-            ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
-            ax1.set_ylabel('Magnitude')
-            ax1.set_title('Predicted State Magnitudes')
-            ax1.set_ylim(0, max(predicted) * 1.2)
+            with col_pred:
+                st.markdown("**Predicted:**")
+                st.write(f"|a| = {pred_a:.3f}")
+                st.write(f"|b| = {pred_b:.3f}")
+                st.write(f"|c| = {pred_c:.3f}")
             
-            # Add value labels on bars
-            for i, v in enumerate(predicted):
-                ax1.text(i, v + 0.05, f'{v:.3f}', ha='center')
+            with col_true:
+                st.markdown("**True (Forward):**")
+                st.write(f"|a| = {true_a:.3f}")
+                st.write(f"|b| = {true_b:.3f}")
+                st.write(f"|c| = {true_c:.3f}")
             
-            # Confidence visualization
-            ax2.pie([st.session_state.inverse_results['confidence'], 
+            with col_diff:
+                st.markdown("**Error:**")
+                st.write(f"Δ|a| = {abs(pred_a - true_a):.3f}")
+                st.write(f"Δ|b| = {abs(pred_b - true_b):.3f}")
+                st.write(f"Δ|c| = {abs(pred_c - true_c):.3f}")
+            
+            # Calculate relative errors
+            rel_error_a = abs(pred_a - true_a) / true_a * 100 if true_a > 0 else 0
+            rel_error_b = abs(pred_b - true_b) / true_b * 100 if true_b > 0 else 0
+            rel_error_c = abs(pred_c - true_c) / true_c * 100 if true_c > 0 else 0
+            avg_rel_error = (rel_error_a + rel_error_b + rel_error_c) / 3
+            
+            st.markdown(f"**Average Relative Error:** {avg_rel_error:.1f}%")
+        else:
+            # Just show predictions if no forward values
+            st.write(f"|a| = {pred_a:.3f}")
+            st.write(f"|b| = {pred_b:.3f}")
+            st.write(f"|c| = {pred_c:.3f}")
+        
+        st.write(f"")
+        st.write(f"**Model Confidence:** {st.session_state.inverse_results['confidence']}%")
+        
+        # Note about phase information
+        st.info("ℹ️ Note: The ML model predicts only magnitudes |a|, |b|, |c|. "
+                "Phase information cannot be recovered from FFT peaks alone due to the "
+                "loss of phase information in the power spectrum.")
+        
+        if st.button("📊 Show Comparison Plots", key="comparison"):
+            # Create comparison plots
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # 1. Bar chart comparing magnitudes
+            if st.session_state.forward_magnitudes:
+                labels = ['|a|', '|b|', '|c|']
+                predicted = [pred_a, pred_b, pred_c]
+                true_vals = [true_a, true_b, true_c]
+                
+                x = np.arange(len(labels))
+                width = 0.35
+                
+                ax1.bar(x - width/2, true_vals, width, label='True', color='blue', alpha=0.7)
+                ax1.bar(x + width/2, predicted, width, label='Predicted', color='green', alpha=0.7)
+                ax1.set_ylabel('Magnitude')
+                ax1.set_title('Magnitude Comparison')
+                ax1.set_xticks(x)
+                ax1.set_xticklabels(labels)
+                ax1.legend()
+                ax1.grid(True, alpha=0.3)
+            else:
+                # Just show predicted if no true values
+                labels = ['|a|', '|b|', '|c|']
+                predicted = [pred_a, pred_b, pred_c]
+                ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
+                ax1.set_ylabel('Magnitude')
+                ax1.set_title('Predicted State Magnitudes')
+                ax1.set_ylim(0, max(predicted) * 1.2)
+            
+            # 2. Radar plot for state visualization
+            categories = ['|a|', '|b|', '|c|']
+            angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+            angles += angles[:1]  # Complete the circle
+            
+            predicted_radar = [pred_a, pred_b, pred_c]
+            predicted_radar += predicted_radar[:1]
+            
+            ax2 = plt.subplot(133, projection='polar')
+            ax2.plot(angles, predicted_radar, 'o-', linewidth=2, label='Predicted', color='green')
+            ax2.fill(angles, predicted_radar, alpha=0.25, color='green')
+            
+            if st.session_state.forward_magnitudes:
+                true_radar = [true_a, true_b, true_c]
+                true_radar += true_radar[:1]
+                ax2.plot(angles, true_radar, 'o-', linewidth=2, label='True', color='blue')
+                ax2.fill(angles, true_radar, alpha=0.25, color='blue')
+            
+            ax2.set_xticks(angles[:-1])
+            ax2.set_xticklabels(categories)
+            ax2.set_title('State Magnitude Profile')
+            ax2.legend()
+            
+            # 3. Confidence visualization
+            ax3.pie([st.session_state.inverse_results['confidence'], 
                     100 - st.session_state.inverse_results['confidence']], 
                    labels=['Confident', 'Uncertain'],
                    colors=['green', 'lightgray'],
                    startangle=90)
-            ax2.set_title('Prediction Confidence')
+            ax3.set_title('Prediction Confidence')
             
+            plt.tight_layout()
             st.pyplot(fig)
 
 # Status bar
@@ -577,21 +790,29 @@ with st.sidebar:
     ### Forward Problem
     1. Set coupling constants (k-values and J)
     2. Enter quantum state amplitudes
-    3. Click "Simulate Dynamics" 
-    4. View detected FFT peaks
+    3. View calculated magnitudes and phases
+    4. Click "Simulate Dynamics" 
+    5. View detected FFT peaks
     
     ### Inverse Problem
     1. Set coupling constants (or lock to sync)
     2. Enter FFT peak frequencies and amplitudes
        - Or use "↩️ Use Forward Results" button
     3. Click "Predict State"
-    4. View predicted quantum state magnitudes
+    4. Compare predicted magnitudes with true values
     
-    ### Features
+    ### Key Features
     - 🔒 Lock icon syncs k-values between panels
     - 📊 Real quantum simulation (not placeholders!)
-    - 🧮 ML-based state prediction
-    - ↩️ Auto-fill inverse from forward results
+    - 📈 Phase information display
+    - 🎯 Direct comparison of forward/inverse results
+    - 📉 Error analysis and visualization
+    
+    ### Important Notes
+    - The inverse problem predicts only magnitudes
+    - Phase information is lost in FFT power spectrum
+    - Relative errors show prediction accuracy
+    - K-values directly affect the FFT peak frequencies
     
     ### Setup Requirements
     1. Run `Qubits6_fitted_spline.py` to generate ML dataset
