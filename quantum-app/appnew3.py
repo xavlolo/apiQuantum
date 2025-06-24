@@ -674,7 +674,7 @@ if st.button("🧮 Predict State", key="predict"):
             
             # Look for neural network models first (they perform better)
             import glob
-            nn_files = glob.glob('quantum_simple_nn_*.pkl')
+            nn_files = glob.glob('quantum_simple_nn_20250623_215653.pkl')
             
             if nn_files:
                 # Use the latest neural network model
