@@ -721,72 +721,57 @@ with col2:
          "Use backup model"]
     )
     
-    # Predict button
-    if st.button("🧮 Predict State", key="predict"):
-        with st.spinner("Running ML prediction..."):
-            try:
-                model_loaded = False
-                model_data = None
+# Replace the model loading section in your predict button with this:
+
+# Predict button
+if st.button("🧮 Predict State", key="predict"):
+    with st.spinner("Running ML prediction..."):
+        try:
+            # Find the best model - UPDATE THE PATH HERE
+            model_file = None
+            
+            # Check in quantum-app subdirectory
+            model_path = 'quantum-app/quantum_simple_nn_20250623_215653.pkl'
+            
+            # Debug info
+            st.write("Debug Info:")
+            st.write(f"Looking for file: {model_path}")
+            st.write(f"File exists: {os.path.exists(model_path)}")
+            
+            # Also check current directory
+            if not os.path.exists(model_path):
+                st.write("Checking alternate locations...")
+                # Try just the filename in case we're already in quantum-app
+                alt_path = 'quantum_simple_nn_20250623_215653.pkl'
+                if os.path.exists(alt_path):
+                    model_path = alt_path
+                    st.write(f"Found at: {alt_path}")
+            
+            # List files to debug
+            st.write("\nDirectory structure:")
+            for root, dirs, files in os.walk('.'):
+                level = root.replace('.', '', 1).count(os.sep)
+                indent = ' ' * 2 * level
+                st.write(f"{indent}{os.path.basename(root)}/")
+                subindent = ' ' * 2 * (level + 1)
+                for file in files[:10]:  # Limit to first 10 files
+                    if file.endswith('.pkl'):
+                        st.write(f"{subindent}{file}")
+            
+            if os.path.exists(model_path):
+                # Check if it's a valid file or LFS pointer
+                file_size = os.path.getsize(model_path)
+                st.write(f"Model file size: {file_size} bytes")
                 
-                # Option 1: Try local file
-                if model_option == "Local file (quantum_simple_nn_20250623_215653.pkl)":
-                    model_file = 'quantum_simple_nn_20250623_215653.pkl'
+                if file_size < 1000:  # Likely an LFS pointer
+                    st.error(f"Model file is too small ({file_size} bytes) - likely a Git LFS pointer")
+                    st.info("The model file needs to be downloaded properly. See sidebar for solutions.")
+                else:
+                    # Load the model
+                    model_data = joblib.load(model_path)
+                    st.success(f"Model loaded successfully from {model_path}")
                     
-                    # Debug info
-                    st.write("Debug Info:")
-                    st.write(f"Looking for file: {model_file}")
-                    st.write(f"File exists: {os.path.exists(model_file)}")
-                    
-                    if os.path.exists(model_file):
-                        is_valid, msg = check_model_file(model_file)
-                        st.write(f"File check: {msg}")
-                        
-                        if is_valid:
-                            try:
-                                model_data = joblib.load(model_file)
-                                model_loaded = True
-                                st.success(f"Model loaded successfully from {model_file}")
-                            except Exception as e:
-                                st.error(f"Failed to load model: {str(e)}")
-                    else:
-                        # List files in current directory
-                        st.write("Files in current directory:")
-                        for f in os.listdir('.'):
-                            st.write(f"  - {f} ({os.path.getsize(f)} bytes)")
-                
-                # Option 2: Download from URL
-                elif model_option == "Download from URL":
-                    st.info("Please upload your model to a cloud service (Google Drive, Dropbox, etc.) and provide the direct download link.")
-                    model_url = st.text_input("Enter direct download URL for the model:")
-                    
-                    if model_url:
-                        model_data = load_model_from_url(model_url)
-                        if model_data:
-                            model_loaded = True
-                            st.success("Model downloaded and loaded successfully!")
-                
-                # Option 3: Use simple backup model
-                elif model_option == "Use backup model":
-                    st.warning("Using simplified backup model (less accurate)")
-                    # Create a simple linear model as backup
-                    from sklearn.linear_model import LinearRegression
-                    from sklearn.preprocessing import StandardScaler
-                    
-                    # Simple backup model
-                    model_data = {
-                        'model': LinearRegression(),
-                        'scaler': StandardScaler(),
-                        'approach': 'Backup Linear Model'
-                    }
-                    
-                    # Fit with dummy data
-                    X_dummy = np.random.rand(100, 10)
-                    y_dummy = np.random.rand(100, 3)
-                    model_data['scaler'].fit(X_dummy)
-                    model_data['model'].fit(X_dummy, y_dummy)
-                    model_loaded = True
-                
-                if model_loaded and model_data:
+                    # Continue with the rest of your prediction code...
                     # CRITICAL: Sort peaks by amplitude (descending) to match training!
                     peak_data = list(zip(peak_freqs, peak_amps))
                     peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
@@ -809,6 +794,9 @@ with col2:
                         model = model_data['model']
                         scaler = model_data['scaler']
                         
+                        # Debug: Show expected features
+                        st.write(f"Model expects {len(model_data['feature_cols'])} features")
+                        
                         # Prepare features EXACTLY as in training
                         features = []
                         
@@ -816,52 +804,99 @@ with col2:
                         for i in range(5):
                             features.extend([sorted_freqs[i], sorted_amps[i]])
                         
-                        # Engineered features
+                        # Engineered features - must match neuralnetwork.py exactly
+                        # Total power
                         total_power = sum(sorted_amps)
+                        
+                        # Number of peaks
                         n_peaks = sum(1 for f in sorted_freqs if f > 0)
+                        
+                        # Max frequency and amplitude (from sorted data)
                         max_freq = max(sorted_freqs)
                         max_amp = max(sorted_amps)
+                        
+                        # Frequency spread - using ALL frequencies including zeros
                         freq_spread = max(sorted_freqs) - min(sorted_freqs)
                         
+                        # Add engineered features in the same order as training
                         features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
                         
+                        # Debug: Show feature values
+                        st.write(f"Total features prepared: {len(features)}")
+                        st.write(f"Engineered features: power={total_power:.3f}, n_peaks={n_peaks}, "
+                                f"max_freq={max_freq:.3f}, max_amp={max_amp:.3f}, spread={freq_spread:.3f}")
+                        
+                        # Convert to numpy array and scale
                         X_test = np.array([features])
                         X_test_scaled = scaler.transform(X_test)
                         
-                        # Predict
+                        # Get model performance info
+                        if 'performance' in model_data:
+                            st.write(f"Model training performance: MAE={model_data['performance']['mae']:.4f}, "
+                                    f"Rel Error={model_data['performance']['relative_error']:.1%}")
+                        
+                        # Predict - handle both single model and ensemble
                         if isinstance(model, dict):
-                            # Ensemble
+                            # This is an ensemble
                             predictions = {}
+                            
+                            # Get predictions from each model
                             for name, m in model.items():
                                 if hasattr(m, 'predict'):
-                                    predictions[name] = m.predict(X_test_scaled)[0]
+                                    pred = m.predict(X_test_scaled)[0]
+                                    predictions[name] = pred
+                                    st.write(f"  {name} prediction: |a|={pred[0]:.3f}, |b|={pred[1]:.3f}, |c|={pred[2]:.3f}")
                             
-                            # Weighted average
-                            weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
-                            y_pred = np.zeros(3)
-                            for name, pred in predictions.items():
-                                weight = weights.get(name, 1.0/len(predictions))
-                                y_pred += pred * weight
-                            y_pred /= sum(weights.values())
+                            # Apply ensemble strategy
+                            approach = model_data.get('approach', 'Ensemble (Weighted)')
+                            
+                            if 'Weighted' in approach:
+                                # Use training weights
+                                weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
+                                y_pred = np.zeros(3)
+                                total_weight = 0
+                                for name, pred in predictions.items():
+                                    weight = weights.get(name, 1.0/len(predictions))
+                                    y_pred += pred * weight
+                                    total_weight += weight
+                                y_pred /= total_weight  # Normalize
+                                st.write("Ensemble strategy: Weighted (rf=0.4, et=0.3, nn=0.3)")
+                            else:
+                                # Simple average
+                                y_pred = np.mean(list(predictions.values()), axis=0)
+                                st.write("Ensemble strategy: Simple average")
                         else:
+                            # Single model
                             y_pred = model.predict(X_test_scaled)[0]
                         
                         # Apply calibration if available
                         if model_data.get('calibration_factors'):
+                            cal_factors = model_data['calibration_factors']
+                            st.write(f"Applying calibration factors: {[f'{c:.3f}' for c in cal_factors]}")
                             for i in range(3):
-                                y_pred[i] *= model_data['calibration_factors'][i]
+                                y_pred[i] *= cal_factors[i]
+                        
+                        # Model info
+                        model_info = model_data.get('approach', 'Neural Network')
+                        
                     else:
-                        # Simple model
+                        # Original model without engineered features
                         model = model_data['model']
                         scaler = model_data['scaler']
                         
+                        # Prepare features (sorted frequencies and amplitudes interleaved)
                         features = []
                         for i in range(5):
                             features.extend([sorted_freqs[i], sorted_amps[i]])
                         
                         X_test = np.array([features])
                         X_test_scaled = scaler.transform(X_test)
+                        
+                        # Predict
                         y_pred = model.predict(X_test_scaled)[0]
+                        
+                        # Model info
+                        model_info = model_data.get('model_type', 'Unknown')
                     
                     # Calculate confidence
                     non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
@@ -873,19 +908,21 @@ with col2:
                         'c_mag': float(y_pred[2]),
                         'confidence': confidence,
                         'success': True,
-                        'model_info': model_data.get('approach', 'Unknown'),
-                        'model_file': model_option
+                        'model_info': model_info,
+                        'model_file': model_path
                     }
                     
-                    st.success(f"✅ Prediction complete using {model_data.get('approach', 'Unknown')}")
-                else:
-                    st.error("Failed to load model. Please check the instructions in the sidebar.")
+                    st.success(f"✅ Prediction complete using {model_info}")
                     
-            except Exception as e:
-                st.error(f"Error in prediction: {str(e)}")
-                import traceback
-                st.text(traceback.format_exc())
-    
+            else:
+                st.error(f"Model file not found at: {model_path}")
+                st.info("Please ensure the model file is in the quantum-app directory.")
+                
+        except Exception as e:
+            st.error(f"Error in prediction: {str(e)}")
+            import traceback
+            st.text(traceback.format_exc())
+            
     # Results section (same as before)
     if st.session_state.inverse_results and st.session_state.inverse_results['success']:
         st.markdown("### 📊 Results")
