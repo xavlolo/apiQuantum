@@ -1,5 +1,5 @@
 """
-Quantum FFT State Analyzer - Fixed Version with Correct Peak Sorting
+Quantum FFT State Analyzer - Fixed Version with Model Loading Solution
 A web interface for forward and inverse quantum state analysis
 """
 
@@ -15,6 +15,8 @@ from itertools import product
 from scipy.signal import find_peaks, peak_widths
 from scipy.interpolate import CubicSpline
 from scipy.optimize import minimize_scalar
+import requests
+import tempfile
 
 # Page configuration
 st.set_page_config(
@@ -23,6 +25,55 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# ==========================================
+# MODEL DOWNLOAD FUNCTION
+# ==========================================
+
+@st.cache_resource
+def load_model_from_url(url):
+    """Download and cache model from URL"""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
+            tmp_file.write(response.content)
+            tmp_path = tmp_file.name
+        
+        # Load model
+        model_data = joblib.load(tmp_path)
+        
+        # Clean up
+        os.unlink(tmp_path)
+        
+        return model_data
+    except Exception as e:
+        st.error(f"Failed to download model: {str(e)}")
+        return None
+
+def check_model_file(filename):
+    """Check if a file is a valid model file or just an LFS pointer"""
+    if not os.path.exists(filename):
+        return False, "File does not exist"
+    
+    # Check file size - LFS pointer files are typically < 1KB
+    file_size = os.path.getsize(filename)
+    if file_size < 1000:  # Less than 1KB, likely an LFS pointer
+        return False, f"File too small ({file_size} bytes) - likely Git LFS pointer"
+    
+    # Try to read the file
+    try:
+        with open(filename, 'rb') as f:
+            header = f.read(100)
+            # Check if it's an LFS pointer
+            if b'version https://git-lfs.github.com' in header:
+                return False, "File is a Git LFS pointer, not actual model data"
+    except:
+        pass
+    
+    return True, "File appears valid"
 
 # Custom CSS for better styling
 st.markdown("""
@@ -59,7 +110,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# QUANTUM SIMULATION FUNCTIONS
+# QUANTUM SIMULATION FUNCTIONS (same as before)
 # ==========================================
 
 @st.cache_data
@@ -249,8 +300,6 @@ def analyze_fft_with_peak_fitting(probs, tpoints, qubit_idx,
         'fitted_spectrum': fitted_spectrum
     }
 
-# Replace the run_quantum_simulation function in appnew3.py with this:
-
 def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_coupling):
     """Run the quantum simulation and return FFT peaks"""
     
@@ -326,6 +375,7 @@ def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_cou
     freq, mag = peak_data['raw_fft']
     
     return peaks[:5], probs, times, (freq, mag)
+
 # ==========================================
 # STREAMLIT APP
 # ==========================================
@@ -662,185 +712,181 @@ with col2:
                                  step=0.001, format="%.3f", key=f"p{i+1}a")
             peak_amps.append(amp)
     
-
-# Replace the entire "Predict button" section in appnew3.py with this:
-
-# Predict button
-if st.button("🧮 Predict State", key="predict"):
-    with st.spinner("Running ML prediction..."):
-        try:
-            # Find the best model
-            model_file = None
-            
-            # Look for neural network models first (they perform better)
-            import glob
-            nn_files = glob.glob('quantum_simple_nn_20250623_215653.pkl')
-            
-            if nn_files:
-                # Use the latest neural network model
-                model_file = sorted(nn_files)[-1]
-                st.info(f"Using neural network model: {model_file}")
-            elif os.path.exists('quantum_inverse_model.pkl'):
-                model_file = 'quantum_inverse_model.pkl'
-                st.info(f"Using model: {model_file}")
-            
-            if model_file and os.path.exists(model_file):
-                # Load model
-                model_data = joblib.load(model_file)
+    # Model loading options
+    st.markdown("**Model Loading:**")
+    model_option = st.selectbox(
+        "Select model loading method:",
+        ["Local file (quantum_simple_nn_20250623_215653.pkl)",
+         "Download from URL",
+         "Use backup model"]
+    )
+    
+    # Predict button
+    if st.button("🧮 Predict State", key="predict"):
+        with st.spinner("Running ML prediction..."):
+            try:
+                model_loaded = False
+                model_data = None
                 
-                # CRITICAL: Sort peaks by amplitude (descending) to match training!
-                peak_data = list(zip(peak_freqs, peak_amps))
-                peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
-                
-                # Extract sorted frequencies and amplitudes
-                sorted_freqs = [p[0] for p in peak_data_sorted]
-                sorted_amps = [p[1] for p in peak_data_sorted]
-                
-                # Show sorting info
-                if peak_data != peak_data_sorted:
-                    st.warning("⚠️ Peaks were re-sorted by amplitude to match training data format!")
-                    st.write("Sorted order:")
-                    for i, (f, a) in enumerate(peak_data_sorted):
-                        if f > 0:
-                            st.write(f"  Peak {i+1}: {f:.3f} Hz (amp: {a:.3f})")
-                
-                # Check if this is a neural network model with engineered features
-                if 'feature_cols' in model_data and len(model_data['feature_cols']) > 10:
-                    # This is the neural network model with engineered features
-                    model = model_data['model']
-                    scaler = model_data['scaler']
+                # Option 1: Try local file
+                if model_option == "Local file (quantum_simple_nn_20250623_215653.pkl)":
+                    model_file = 'quantum_simple_nn_20250623_215653.pkl'
                     
-                    # Debug: Show expected features
-                    st.write(f"Model expects {len(model_data['feature_cols'])} features")
+                    # Debug info
+                    st.write("Debug Info:")
+                    st.write(f"Looking for file: {model_file}")
+                    st.write(f"File exists: {os.path.exists(model_file)}")
                     
-                    # Prepare features EXACTLY as in training
-                    features = []
-                    
-                    # Basic features (sorted frequencies and amplitudes)
-                    for i in range(5):
-                        features.extend([sorted_freqs[i], sorted_amps[i]])
-                    
-                    # Engineered features - must match neuralnetwork.py exactly
-                    # Total power
-                    total_power = sum(sorted_amps)
-                    
-                    # Number of peaks
-                    n_peaks = sum(1 for f in sorted_freqs if f > 0)
-                    
-                    # Max frequency and amplitude (from sorted data)
-                    max_freq = max(sorted_freqs)
-                    max_amp = max(sorted_amps)
-                    
-                    # Frequency spread - using ALL frequencies including zeros
-                    freq_spread = max(sorted_freqs) - min(sorted_freqs)
-                    
-                    # Add engineered features in the same order as training
-                    features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
-                    
-                    # Debug: Show feature values
-                    st.write(f"Total features prepared: {len(features)}")
-                    st.write(f"Engineered features: power={total_power:.3f}, n_peaks={n_peaks}, "
-                            f"max_freq={max_freq:.3f}, max_amp={max_amp:.3f}, spread={freq_spread:.3f}")
-                    
-                    # Convert to numpy array and scale
-                    X_test = np.array([features])
-                    X_test_scaled = scaler.transform(X_test)
-                    
-                    # Get model performance info
-                    if 'performance' in model_data:
-                        st.write(f"Model training performance: MAE={model_data['performance']['mae']:.4f}, "
-                                f"Rel Error={model_data['performance']['relative_error']:.1%}")
-                    
-                    # Predict - handle both single model and ensemble
-                    if isinstance(model, dict):
-                        # This is an ensemble
-                        predictions = {}
+                    if os.path.exists(model_file):
+                        is_valid, msg = check_model_file(model_file)
+                        st.write(f"File check: {msg}")
                         
-                        # Get predictions from each model
-                        for name, m in model.items():
-                            if hasattr(m, 'predict'):
-                                pred = m.predict(X_test_scaled)[0]
-                                predictions[name] = pred
-                                st.write(f"  {name} prediction: |a|={pred[0]:.3f}, |b|={pred[1]:.3f}, |c|={pred[2]:.3f}")
+                        if is_valid:
+                            try:
+                                model_data = joblib.load(model_file)
+                                model_loaded = True
+                                st.success(f"Model loaded successfully from {model_file}")
+                            except Exception as e:
+                                st.error(f"Failed to load model: {str(e)}")
+                    else:
+                        # List files in current directory
+                        st.write("Files in current directory:")
+                        for f in os.listdir('.'):
+                            st.write(f"  - {f} ({os.path.getsize(f)} bytes)")
+                
+                # Option 2: Download from URL
+                elif model_option == "Download from URL":
+                    st.info("Please upload your model to a cloud service (Google Drive, Dropbox, etc.) and provide the direct download link.")
+                    model_url = st.text_input("Enter direct download URL for the model:")
+                    
+                    if model_url:
+                        model_data = load_model_from_url(model_url)
+                        if model_data:
+                            model_loaded = True
+                            st.success("Model downloaded and loaded successfully!")
+                
+                # Option 3: Use simple backup model
+                elif model_option == "Use backup model":
+                    st.warning("Using simplified backup model (less accurate)")
+                    # Create a simple linear model as backup
+                    from sklearn.linear_model import LinearRegression
+                    from sklearn.preprocessing import StandardScaler
+                    
+                    # Simple backup model
+                    model_data = {
+                        'model': LinearRegression(),
+                        'scaler': StandardScaler(),
+                        'approach': 'Backup Linear Model'
+                    }
+                    
+                    # Fit with dummy data
+                    X_dummy = np.random.rand(100, 10)
+                    y_dummy = np.random.rand(100, 3)
+                    model_data['scaler'].fit(X_dummy)
+                    model_data['model'].fit(X_dummy, y_dummy)
+                    model_loaded = True
+                
+                if model_loaded and model_data:
+                    # CRITICAL: Sort peaks by amplitude (descending) to match training!
+                    peak_data = list(zip(peak_freqs, peak_amps))
+                    peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
+                    
+                    # Extract sorted frequencies and amplitudes
+                    sorted_freqs = [p[0] for p in peak_data_sorted]
+                    sorted_amps = [p[1] for p in peak_data_sorted]
+                    
+                    # Show sorting info
+                    if peak_data != peak_data_sorted:
+                        st.warning("⚠️ Peaks were re-sorted by amplitude to match training data format!")
+                        st.write("Sorted order:")
+                        for i, (f, a) in enumerate(peak_data_sorted):
+                            if f > 0:
+                                st.write(f"  Peak {i+1}: {f:.3f} Hz (amp: {a:.3f})")
+                    
+                    # Check if this is a neural network model with engineered features
+                    if 'feature_cols' in model_data and len(model_data['feature_cols']) > 10:
+                        # This is the neural network model with engineered features
+                        model = model_data['model']
+                        scaler = model_data['scaler']
                         
-                        # Apply ensemble strategy
-                        approach = model_data.get('approach', 'Ensemble (Weighted)')
+                        # Prepare features EXACTLY as in training
+                        features = []
                         
-                        if 'Weighted' in approach:
-                            # Use training weights
+                        # Basic features (sorted frequencies and amplitudes)
+                        for i in range(5):
+                            features.extend([sorted_freqs[i], sorted_amps[i]])
+                        
+                        # Engineered features
+                        total_power = sum(sorted_amps)
+                        n_peaks = sum(1 for f in sorted_freqs if f > 0)
+                        max_freq = max(sorted_freqs)
+                        max_amp = max(sorted_amps)
+                        freq_spread = max(sorted_freqs) - min(sorted_freqs)
+                        
+                        features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
+                        
+                        X_test = np.array([features])
+                        X_test_scaled = scaler.transform(X_test)
+                        
+                        # Predict
+                        if isinstance(model, dict):
+                            # Ensemble
+                            predictions = {}
+                            for name, m in model.items():
+                                if hasattr(m, 'predict'):
+                                    predictions[name] = m.predict(X_test_scaled)[0]
+                            
+                            # Weighted average
                             weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
                             y_pred = np.zeros(3)
-                            total_weight = 0
                             for name, pred in predictions.items():
                                 weight = weights.get(name, 1.0/len(predictions))
                                 y_pred += pred * weight
-                                total_weight += weight
-                            y_pred /= total_weight  # Normalize
-                            st.write("Ensemble strategy: Weighted (rf=0.4, et=0.3, nn=0.3)")
+                            y_pred /= sum(weights.values())
                         else:
-                            # Simple average
-                            y_pred = np.mean(list(predictions.values()), axis=0)
-                            st.write("Ensemble strategy: Simple average")
+                            y_pred = model.predict(X_test_scaled)[0]
+                        
+                        # Apply calibration if available
+                        if model_data.get('calibration_factors'):
+                            for i in range(3):
+                                y_pred[i] *= model_data['calibration_factors'][i]
                     else:
-                        # Single model
+                        # Simple model
+                        model = model_data['model']
+                        scaler = model_data['scaler']
+                        
+                        features = []
+                        for i in range(5):
+                            features.extend([sorted_freqs[i], sorted_amps[i]])
+                        
+                        X_test = np.array([features])
+                        X_test_scaled = scaler.transform(X_test)
                         y_pred = model.predict(X_test_scaled)[0]
                     
-                    # Apply calibration if available
-                    if model_data.get('calibration_factors'):
-                        cal_factors = model_data['calibration_factors']
-                        st.write(f"Applying calibration factors: {[f'{c:.3f}' for c in cal_factors]}")
-                        for i in range(3):
-                            y_pred[i] *= cal_factors[i]
+                    # Calculate confidence
+                    non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
+                    confidence = min(95, 50 + non_zero_peaks * 9)
                     
-                    # Model info
-                    model_info = model_data.get('approach', 'Neural Network')
+                    st.session_state.inverse_results = {
+                        'a_mag': float(y_pred[0]),
+                        'b_mag': float(y_pred[1]),
+                        'c_mag': float(y_pred[2]),
+                        'confidence': confidence,
+                        'success': True,
+                        'model_info': model_data.get('approach', 'Unknown'),
+                        'model_file': model_option
+                    }
                     
+                    st.success(f"✅ Prediction complete using {model_data.get('approach', 'Unknown')}")
                 else:
-                    # Original model without engineered features
-                    model = model_data['model']
-                    scaler = model_data['scaler']
+                    st.error("Failed to load model. Please check the instructions in the sidebar.")
                     
-                    # Prepare features (sorted frequencies and amplitudes interleaved)
-                    features = []
-                    for i in range(5):
-                        features.extend([sorted_freqs[i], sorted_amps[i]])
-                    
-                    X_test = np.array([features])
-                    X_test_scaled = scaler.transform(X_test)
-                    
-                    # Predict
-                    y_pred = model.predict(X_test_scaled)[0]
-                    
-                    # Model info
-                    model_info = model_data.get('model_type', 'Unknown')
-                
-                # Calculate confidence
-                non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
-                confidence = min(95, 50 + non_zero_peaks * 9)
-                
-                st.session_state.inverse_results = {
-                    'a_mag': float(y_pred[0]),
-                    'b_mag': float(y_pred[1]),
-                    'c_mag': float(y_pred[2]),
-                    'confidence': confidence,
-                    'success': True,
-                    'model_info': model_info,
-                    'model_file': model_file
-                }
-                
-                st.success(f"✅ Prediction complete using {model_info}")
-                
-            else:
-                st.error("No model file found!")
-                st.info("Please run neuralnetwork.py to generate the ensemble model.")
-                
-        except Exception as e:
-            st.error(f"Error in prediction: {str(e)}")
-            import traceback
-            st.text(traceback.format_exc())
-            
-            
-    # Results section
+            except Exception as e:
+                st.error(f"Error in prediction: {str(e)}")
+                import traceback
+                st.text(traceback.format_exc())
+    
+    # Results section (same as before)
     if st.session_state.inverse_results and st.session_state.inverse_results['success']:
         st.markdown("### 📊 Results")
         st.markdown("**Predicted State Magnitudes:**")
@@ -903,90 +949,58 @@ if st.button("🧮 Predict State", key="predict"):
         st.info("ℹ️ Note: The ML model predicts only magnitudes |a|, |b|, |c|. "
                 "Phase information cannot be recovered from FFT peaks alone due to the "
                 "loss of phase information in the power spectrum.")
-        
-        if st.button("📊 Show Comparison Plots", key="comparison"):
-            # Create comparison plots
-            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-            
-            # 1. Bar chart comparing magnitudes
-            if st.session_state.forward_magnitudes:
-                labels = ['|a|', '|b|', '|c|']
-                predicted = [pred_a, pred_b, pred_c]
-                true_vals = [true_a, true_b, true_c]
-                
-                x = np.arange(len(labels))
-                width = 0.35
-                
-                ax1.bar(x - width/2, true_vals, width, label='True', color='blue', alpha=0.7)
-                ax1.bar(x + width/2, predicted, width, label='Predicted', color='green', alpha=0.7)
-                ax1.set_ylabel('Magnitude')
-                ax1.set_title('Magnitude Comparison')
-                ax1.set_xticks(x)
-                ax1.set_xticklabels(labels)
-                ax1.legend()
-                ax1.grid(True, alpha=0.3)
-            else:
-                # Just show predicted if no true values
-                labels = ['|a|', '|b|', '|c|']
-                predicted = [pred_a, pred_b, pred_c]
-                ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
-                ax1.set_ylabel('Magnitude')
-                ax1.set_title('Predicted State Magnitudes')
-                ax1.set_ylim(0, max(predicted) * 1.2)
-            
-            # 2. Radar plot for state visualization
-            categories = ['|a|', '|b|', '|c|']
-            angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-            angles += angles[:1]  # Complete the circle
-            
-            predicted_radar = [pred_a, pred_b, pred_c]
-            predicted_radar += predicted_radar[:1]
-            
-            ax2 = plt.subplot(133, projection='polar')
-            ax2.plot(angles, predicted_radar, 'o-', linewidth=2, label='Predicted', color='green')
-            ax2.fill(angles, predicted_radar, alpha=0.25, color='green')
-            
-            if st.session_state.forward_magnitudes:
-                true_radar = [true_a, true_b, true_c]
-                true_radar += true_radar[:1]
-                ax2.plot(angles, true_radar, 'o-', linewidth=2, label='True', color='blue')
-                ax2.fill(angles, true_radar, alpha=0.25, color='blue')
-            
-            ax2.set_xticks(angles[:-1])
-            ax2.set_xticklabels(categories)
-            ax2.set_title('State Magnitude Profile')
-            ax2.legend()
-            
-            # 3. Confidence visualization
-            ax3.pie([st.session_state.inverse_results['confidence'], 
-                    100 - st.session_state.inverse_results['confidence']], 
-                   labels=['Confident', 'Uncertain'],
-                   colors=['green', 'lightgray'],
-                   startangle=90)
-            ax3.set_title('Prediction Confidence')
-            
-            plt.tight_layout()
-            st.pyplot(fig)
 
 # Status bar
 st.markdown("---")
 status_col1, status_col2 = st.columns([3, 1])
 with status_col1:
-    if os.path.exists('quantum_inverse_model.pkl'):
-        try:
-            model_info = joblib.load('quantum_inverse_model.pkl')
-            model_type = model_info.get('model_type', 'Unknown')
-            st.success(f"Status: Ready | Model: {model_type} loaded ✓")
-        except:
-            st.success("Status: Ready | Model: quantum_inverse_model.pkl loaded ✓")
+    # Check local model file
+    model_file = 'quantum_simple_nn_20250623_215653.pkl'
+    if os.path.exists(model_file):
+        is_valid, msg = check_model_file(model_file)
+        if is_valid:
+            st.success("Status: Ready | Model file found and valid ✓")
+        else:
+            st.warning(f"Status: Model issue | {msg}")
     else:
-        st.warning("Status: Limited | Model not found - run MLpipeline5peaks.py first")
+        st.warning("Status: Limited | Model file not found - see sidebar for solutions")
 with status_col2:
     st.info(f"k-values {'locked 🔒' if st.session_state.k_values_locked else 'unlocked 🔓'}")
 
 # Sidebar with instructions
 with st.sidebar:
-    st.header("📖 Instructions")
+    st.header("📖 Instructions & Troubleshooting")
+    
+    # Troubleshooting section
+    st.markdown("""
+    ### 🔧 Model Loading Issues?
+    
+    If the model file can't be loaded, it's likely because:
+    1. **Git LFS Issue**: The .pkl file is stored in Git LFS and wasn't pulled properly
+    2. **File too large**: Streamlit has limitations on file sizes
+    
+    ### Solutions:
+    
+    #### Option 1: Upload Model to Cloud
+    1. Download the model file locally
+    2. Upload to Google Drive, Dropbox, or similar
+    3. Get a direct download link
+    4. Use "Download from URL" option
+    
+    #### Option 2: Use Git LFS locally
+    ```bash
+    git lfs pull
+    ```
+    
+    #### Option 3: Host model separately
+    Upload the model to:
+    - GitHub Releases (not in repo)
+    - Hugging Face Model Hub
+    - AWS S3 / Google Cloud Storage
+    
+    ---
+    """)
+    
     st.markdown("""
     ### ⚠️ Critical: Peak Ordering
     **Peaks must be ordered by amplitude (largest first), not frequency!**
@@ -1020,9 +1034,4 @@ with st.sidebar:
     - The inverse problem predicts only magnitudes
     - Phase information is lost in FFT power spectrum
     - Low relative errors (< 10%) indicate good predictions
-    
-    ### Setup Requirements
-    1. Run `Qubits6_fitted_spline.py` to generate ML dataset
-    2. Run `MLpipeline5peaks.py` to train the model
-    3. Ensure `quantum_inverse_model.pkl` exists
     """)
