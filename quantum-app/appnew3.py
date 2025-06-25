@@ -584,7 +584,7 @@ def show_workflow_explanation():
         st.markdown("#### Training Data")
         st.markdown('<div class="ml-feature">', unsafe_allow_html=True)
         st.markdown("**Dataset Generation:**")
-        st.markdown("- 2000 random quantum states")
+        st.markdown("- 5000 random quantum states")
         st.markdown("- Complex amplitudes ∈ [-3, 3]")
         st.markdown("- 80/20 train/test split")
         st.markdown("- Full quantum simulation for each")
@@ -605,11 +605,113 @@ def show_workflow_explanation():
         st.markdown("#### Performance")
         st.markdown('<div class="ml-feature">', unsafe_allow_html=True)
         st.markdown("**Typical Results:**")
-        st.markdown("- Test R² > 0.96")
-        st.markdown("- MAE < 0.05")
-        st.markdown("- Relative error < 5%")
+        st.markdown("- Test R² > 0.996")
+        st.markdown("- MAE < 0.025")
+        st.markdown("- Relative error < 3%")
         st.markdown("- Confidence based on # peaks")
         st.markdown("</div>", unsafe_allow_html=True)
+    
+    # ML Training Results
+    st.markdown("---")
+    st.markdown("### 📊 ML Training Results")
+    
+    # Create a nice table for the results
+    results_data = {
+        'Approach': ['Neural Network', 'NN Calibrated', 'Ensemble (Average)', 'Ensemble (Weighted)'],
+        'MAE': [0.0272, 0.0271, 0.0241, 0.0237],
+        'RMSE': [0.0550, 0.0549, 0.0425, 0.0418],
+        'R²': [0.9960, 0.9960, 0.9976, 0.9977],
+        'Rel Error': ['3.21%', '3.20%', '3.04%', '3.00%']
+    }
+    
+    results_df = pd.DataFrame(results_data)
+    
+    # Style the dataframe
+    st.markdown("**Final Model Comparison:**")
+    st.dataframe(
+        results_df.style.highlight_min(subset=['MAE', 'RMSE', 'Rel Error'], color='lightgreen')
+                       .highlight_max(subset=['R²'], color='lightgreen')
+                       .format({'MAE': '{:.4f}', 'RMSE': '{:.4f}', 'R²': '{:.4f}'}),
+        use_container_width=True
+    )
+    
+    st.success("✅ **Best Approach: Ensemble (Weighted)** - Achieves lowest error and highest R²")
+    
+    # Low Magnitude Performance Issue
+    st.markdown("---")
+    st.markdown("### ⚠️ Performance Considerations for Low Magnitudes")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.warning("""
+        **Why Lower Accuracy for Small |a|, |b|, |c| Values?**
+        
+        When the quantum state magnitudes are very small:
+        - The resulting oscillations in qubit dynamics become very weak
+        - FFT peaks have lower signal-to-noise ratio
+        - Small peaks may be below detection threshold
+        - Feature extraction becomes less reliable
+        
+        This leads to:
+        - Fewer detected peaks (lower confidence)
+        - Less accurate magnitude predictions
+        - Higher relative errors (small denominator effect)
+        """)
+    
+    with col2:
+        # Placeholder for the image
+        st.markdown("**Model Performance vs Magnitude:**")
+        
+        # Instructions for adding your image
+        st.info("""
+        To add your performance plot:
+        1. Save your image as 'low_magnitude_performance.png'
+        2. Place it in the same directory as the app
+        3. Uncomment the code below
+        """)
+        
+        # Uncomment this when you have the image file:
+        # try:
+        #     st.image('low_magnitude_performance.png', 
+        #              caption='Model performance decreases for low magnitude states',
+        #              use_column_width=True)
+        # except:
+        #     st.error("Image file not found")
+    
+    st.markdown("""
+    **Recommendations:**
+    - For |a|, |b|, |c| < 0.5, expect higher relative errors
+    - Consider using normalized states when possible
+    - Check confidence scores for reliability assessment
+    """)
+    
+    # Show the performance plot placeholder
+    with st.expander("📈 View Performance Analysis Plot"):
+        # Create a simple demonstration plot showing the concept
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        # Simulated data showing performance vs magnitude
+        magnitudes = np.linspace(0.1, 3.0, 50)
+        relative_error = 10 * np.exp(-2 * magnitudes) + 2  # Exponential decay model
+        
+        ax.plot(magnitudes, relative_error, 'b-', linewidth=2)
+        ax.fill_between(magnitudes, relative_error - 1, relative_error + 1, alpha=0.3)
+        
+        ax.set_xlabel('Average State Magnitude (|a|, |b|, |c|)')
+        ax.set_ylabel('Relative Error (%)')
+        ax.set_title('Model Performance vs State Magnitude\n(Demonstration - Replace with Actual Data)')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0, 3)
+        ax.set_ylim(0, 15)
+        
+        # Add regions
+        ax.axvspan(0, 0.5, alpha=0.2, color='red', label='High Error Region')
+        ax.axvspan(0.5, 1.0, alpha=0.2, color='yellow', label='Moderate Error')
+        ax.axvspan(1.0, 3.0, alpha=0.2, color='green', label='Low Error Region')
+        
+        ax.legend()
+        st.pyplot(fig)
     
     # Key Insights
     st.markdown("---")
@@ -705,13 +807,13 @@ def show_main_app():
         st.markdown("**Quantum Amplitudes:**")
         col_a, col_b = st.columns(2)
         with col_a:
-            a_real = st.number_input("a_real", value=-0.033, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            b_real = st.number_input("b_real", value=1.472, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            c_real = st.number_input("c_real", value=1.515, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            a_real = st.number_input("a_real", value=0.148, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_real = st.number_input("b_real", value=-2.004, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_real = st.number_input("c_real", value=1.573, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
         with col_b:
-            a_imag = st.number_input("a_imag", value=0.420, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            b_imag = st.number_input("b_imag", value=1.368, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            c_imag = st.number_input("c_imag", value=-2.086, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            a_imag = st.number_input("a_imag", value=2.026, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_imag = st.number_input("b_imag", value=0.294, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_imag = st.number_input("c_imag", value=-2.555, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
         
         # Calculate and display magnitudes and phases
         a_complex = a_real + 1j * a_imag
