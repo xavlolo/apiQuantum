@@ -214,9 +214,9 @@ def analyze_fft_with_peak_fitting(probs, tpoints, qubit_idx,
     pos_mag = np.abs(fft[mask])
     
     threshold = min_peak_height * np.max(pos_mag)
-    peaks, _ = find_peaks(pos_mag, height=threshold, distance=3)
+    peaks, _ = find_peaks(pos_mag, height=threshold, distance=1)
     
-    if len(peaks) > 0 and pos_freq[peaks[0]] < 0.03:
+    if len(peaks) > 0 and pos_freq[peaks[0]] < 0.01:
         peaks = peaks[1:]
     
     if len(peaks) == 0:
