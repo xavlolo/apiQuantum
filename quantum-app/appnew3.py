@@ -1255,31 +1255,490 @@ def show_main_app():
         st.plotly_chart(draw_network_diagram(), use_container_width=True)
 
     st.markdown("---")
-    st.markdown("### Quick Forward/Inverse Demo")
-    st.info("For detailed analysis, use the **Test Performance Analysis** tab above.")
 
-    # Simplified demo version - show core functionality
+    # Create two columns for forward and inverse problems
     col1, col2 = st.columns(2)
 
+    # FORWARD PROBLEM (Left Panel)
     with col1:
-        st.markdown("**Forward Demo:** Quantum State → FFT Peaks")
-        if st.button("🔄 Run Demo Simulation"):
-            # Quick demo with fixed values
-            a_complex = 0.148 + 2.026j
-            b_complex = -2.004 + 0.294j  
-            c_complex = 1.573 - 2.555j
-            
-            with st.spinner("Running simulation..."):
-                peaks, _, _, _ = run_quantum_simulation(a_complex, b_complex, c_complex, 0.7, 1.0, 1.9, 0.5)
+        st.header("➡️ Forward Problem")
+        st.subheader("Quantum State → FFT Peaks")
+        
+        # Lock icon for k-values
+        lock_col1, lock_col2 = st.columns([4, 1])
+        with lock_col2:
+            st.session_state.k_values_locked = st.checkbox("🔒", value=st.session_state.k_values_locked, 
+                                                           help="Lock k-values between panels")
+        
+        # Coupling constants
+        st.markdown("**Coupling Constants:**")
+        k01_forward = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_f")
+        k23_forward = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_f")
+        k45_forward = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_f")
+        j_coupling_forward = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_f")
+        
+        # Initial state info
+        st.markdown("**Initial State:**")
+        st.latex(r"|ψ⟩ = a|110000⟩ + b|100100⟩ + c|100001⟩")
+        
+        # Quantum amplitudes
+        st.markdown("**Quantum Amplitudes:**")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            a_real = st.number_input("a_real", value=0.148, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_real = st.number_input("b_real", value=-2.004, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_real = st.number_input("c_real", value=1.573, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+        with col_b:
+            a_imag = st.number_input("a_imag", value=2.026, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_imag = st.number_input("b_imag", value=0.294, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_imag = st.number_input("c_imag", value=-2.555, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+        
+        # Calculate and display magnitudes and phases
+        a_complex = a_real + 1j * a_imag
+        b_complex = b_real + 1j * b_imag
+        c_complex = c_real + 1j * c_imag
+        
+        a_mag = abs(a_complex)
+        b_mag = abs(b_complex)
+        c_mag = abs(c_complex)
+        
+        a_phase = np.angle(a_complex, deg=True)
+        b_phase = np.angle(b_complex, deg=True)
+        c_phase = np.angle(c_complex, deg=True)
+        
+        # Store magnitudes in session state
+        st.session_state.forward_magnitudes = {'a': a_mag, 'b': b_mag, 'c': c_mag}
+        
+        # Display magnitudes and phases
+        st.markdown("**Calculated Values:**")
+        col_mag, col_phase = st.columns(2)
+        with col_mag:
+            st.markdown("**Magnitudes:**")
+            st.markdown(f'<div class="magnitude-display">|a| = {a_mag:.3f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="magnitude-display">|b| = {b_mag:.3f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="magnitude-display">|c| = {c_mag:.3f}</div>', unsafe_allow_html=True)
+        with col_phase:
+            st.markdown("**Phases (degrees):**")
+            st.markdown(f'<div class="phase-display">φ_a = {a_phase:.1f}°</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="phase-display">φ_b = {b_phase:.1f}°</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="phase-display">φ_c = {c_phase:.1f}°</div>', unsafe_allow_html=True)
+        
+        # Simulate button
+        if st.button("🔄 Simulate Dynamics", key="simulate"):
+            with st.spinner("Running quantum simulation..."):
+                # Run actual simulation
+                peaks, probs, times, fft_data = run_quantum_simulation(
+                    a_complex, b_complex, c_complex,
+                    k01_forward, k23_forward, k45_forward, j_coupling_forward
+                )
                 
-            st.markdown("**Detected Peaks:**")
-            for i, peak in enumerate(peaks):
-                if peak['freq'] > 0:
-                    st.write(f"• Peak {i+1}: {peak['freq']:.3f} Hz (amp: {peak['amp']:.3f})")
+                st.session_state.forward_results = {
+                    'peaks': peaks,
+                    'probs': probs,
+                    'times': times,
+                    'fft_data': fft_data,
+                    'success': True
+                }
+        
+        # Results section
+        if st.session_state.forward_results and st.session_state.forward_results['success']:
+            st.markdown("### 📊 Results")
+            st.markdown("**Detected Peaks (sorted by amplitude):**")
+            
+            peaks = st.session_state.forward_results['peaks']
+            if peaks:
+                for i, peak in enumerate(peaks):
+                    if peak['freq'] > 0:  # Only show non-zero peaks
+                        st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
+            else:
+                st.write("No significant peaks detected")
+            
+            col_plot1, col_plot2 = st.columns(2)
+            with col_plot1:
+                if st.button("📊 Show FFT Plot", key="fft_plot"):
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    
+                    # Get actual FFT data
+                    freq, mag = st.session_state.forward_results['fft_data']
+                    
+                    ax.plot(freq, mag, 'b-', linewidth=1.5)
+                    
+                    # Mark peaks
+                    for i, peak in enumerate(peaks):
+                        if peak['freq'] > 0:
+                            ax.axvline(peak['freq'], color='red', linestyle='--', alpha=0.5)
+                            ax.plot(peak['freq'], peak['amp'], 'ro', markersize=8)
+                            ax.text(peak['freq'], peak['amp'] + 0.01, f"{i+1}", ha='center', fontsize=8)
+                    
+                    ax.set_xlabel('Frequency (Hz)')
+                    ax.set_ylabel('Magnitude')
+                    ax.set_title('FFT of Q4 (peaks numbered by amplitude rank)')
+                    ax.grid(True, alpha=0.3)
+                    ax.set_xlim(0, 2)
+                    st.pyplot(fig)
+            
+            with col_plot2:
+                if st.button("📈 Show Dynamics", key="dynamics_plot"):
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    probs = st.session_state.forward_results['probs']
+                    times = st.session_state.forward_results['times']
+                    
+                    ax.plot(times, probs[:, 4], 'b-', linewidth=1.5)
+                    ax.set_xlabel('Time')
+                    ax.set_ylabel('P(1)')
+                    ax.set_title('Q4 Dynamics')
+                    ax.grid(True, alpha=0.3)
+                    ax.set_ylim(-0.05, 1.05)
+                    st.pyplot(fig)
 
+    # INVERSE PROBLEM (Right Panel)
     with col2:
-        st.markdown("**Inverse Demo:** FFT Peaks → State Magnitudes")
-        st.info("Use the full interface in previous versions or the Test Performance Analysis tab for complete inverse functionality.")
+        st.header("⬅️ Inverse Problem")
+        st.subheader("FFT Peaks → Quantum State")
+        
+        # Coupling constants (synchronized if locked)
+        st.markdown("**Coupling Constants:**")
+        if st.session_state.k_values_locked:
+            k01_inverse = st.number_input("k(0,1)", value=k01_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k01_i", disabled=True)
+            k23_inverse = st.number_input("k(2,3)", value=k23_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k23_i", disabled=True)
+            k45_inverse = st.number_input("k(4,5)", value=k45_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k45_i", disabled=True)
+            j_coupling_inverse = st.number_input("J-coupling", value=j_coupling_forward, min_value=0.0, max_value=2.0, 
+                                               step=0.1, key="j_i", disabled=True)
+        else:
+            k01_inverse = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_i")
+            k23_inverse = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_i")
+            k45_inverse = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_i")
+            j_coupling_inverse = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_i")
+        
+        # Important note about peak ordering
+        st.info("ℹ️ **Important**: Peaks should be ordered by amplitude (largest first), not frequency!")
+        
+        # Auto-fill from forward results
+        if st.session_state.forward_results and st.button("↩️ Use Forward Results", key="autofill"):
+            peaks = st.session_state.forward_results['peaks']
+            st.success("Peak values loaded! They are already sorted by amplitude as required.")
+        
+        # FFT Peak inputs
+        st.markdown("**FFT Peak Frequencies (Hz):**")
+        st.markdown("*Enter peaks in order of decreasing amplitude*")
+        col_freq, col_amp = st.columns(2)
+        
+        # Initialize default values
+        default_peaks = []
+        if st.session_state.forward_results:
+            default_peaks = st.session_state.forward_results['peaks']
+        
+        with col_freq:
+            st.markdown("**Frequencies:**")
+            peak_freqs = []
+            for i in range(5):
+                default_freq = float(default_peaks[i]['freq']) if i < len(default_peaks) else 0.0
+                freq = st.number_input(f"Peak {i+1}", value=default_freq, min_value=0.0, max_value=5.0, 
+                                      step=0.001, format="%.3f", key=f"p{i+1}f")
+                peak_freqs.append(freq)
+        
+        with col_amp:
+            st.markdown("**Amplitudes:**")
+            peak_amps = []
+            for i in range(5):
+                default_amp = float(default_peaks[i]['amp']) if i < len(default_peaks) else 0.0
+                # More reasonable maximum based on typical values
+                max_amp = 20.0
+                if default_amp > max_amp:
+                    st.warning(f"Peak {i+1} amplitude {default_amp:.3f} exceeds maximum, capping at {max_amp}")
+                    default_amp = max_amp
+                amp = st.number_input(f"Amp {i+1}", value=default_amp, min_value=0.0, max_value=max_amp, 
+                                     step=0.001, format="%.3f", key=f"p{i+1}a")
+                peak_amps.append(amp)
+        
+        # Model loading options
+        st.markdown("**Model Loading:**")
+        model_option = st.selectbox(
+            "Select model loading method:",
+            ["Local file (quantum_simple_nn_20250623_215653.pkl)",
+             "Download from URL",
+             "Use backup model"]
+        )
+        
+        # Predict button
+        if st.button("🧮 Predict State", key="predict"):
+            with st.spinner("Running ML prediction..."):
+                try:
+                    # Find the best model
+                    model_paths = [
+                        'quantum_simple_nn_20250623_215653.pkl',
+                        'quantum-app/quantum_simple_nn_20250623_215653.pkl',
+                        'quantum_inverse_model.pkl'
+                    ]
+                    
+                    model_path = None
+                    for path in model_paths:
+                        if os.path.exists(path):
+                            model_path = path
+                            break
+                    
+                    if model_path and os.path.exists(model_path):
+                        # Load the model
+                        model_data = joblib.load(model_path)
+                        st.success(f"Model loaded successfully from {model_path}")
+                        
+                        # CRITICAL: Sort peaks by amplitude (descending) to match training!
+                        peak_data = list(zip(peak_freqs, peak_amps))
+                        peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
+                        
+                        # Extract sorted frequencies and amplitudes
+                        sorted_freqs = [p[0] for p in peak_data_sorted]
+                        sorted_amps = [p[1] for p in peak_data_sorted]
+                        
+                        # Show sorting info
+                        if peak_data != peak_data_sorted:
+                            st.warning("⚠️ Peaks were re-sorted by amplitude to match training data format!")
+                            st.write("Sorted order:")
+                            for i, (f, a) in enumerate(peak_data_sorted):
+                                if f > 0:
+                                    st.write(f"  Peak {i+1}: {f:.3f} Hz (amp: {a:.3f})")
+                        
+                        # Check if this is a neural network model with engineered features
+                        if 'feature_cols' in model_data and len(model_data['feature_cols']) > 10:
+                            # This is the neural network model with engineered features
+                            model = model_data['model']
+                            scaler = model_data['scaler']
+                            
+                            # Prepare features EXACTLY as in training
+                            features = []
+                            
+                            # Basic features (sorted frequencies and amplitudes)
+                            for i in range(5):
+                                features.extend([sorted_freqs[i], sorted_amps[i]])
+                            
+                            # Engineered features - must match neuralnetwork.py exactly
+                            total_power = sum(sorted_amps)
+                            n_peaks = sum(1 for f in sorted_freqs if f > 0)
+                            max_freq = max(sorted_freqs)
+                            max_amp = max(sorted_amps)
+                            freq_spread = max(sorted_freqs) - min(sorted_freqs)
+                            
+                            # Add engineered features in the same order as training
+                            features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
+                            
+                            # Convert to numpy array and scale
+                            X_test = np.array([features])
+                            X_test_scaled = scaler.transform(X_test)
+                            
+                            # Predict - handle both single model and ensemble
+                            if isinstance(model, dict):
+                                # This is an ensemble
+                                predictions = {}
+                                
+                                # Get predictions from each model
+                                for name, m in model.items():
+                                    if hasattr(m, 'predict'):
+                                        pred = m.predict(X_test_scaled)[0]
+                                        predictions[name] = pred
+                                
+                                # Apply ensemble strategy
+                                approach = model_data.get('approach', 'Ensemble (Weighted)')
+                                
+                                if 'Weighted' in approach:
+                                    # Use training weights
+                                    weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
+                                    y_pred = np.zeros(3)
+                                    total_weight = 0
+                                    for name, pred in predictions.items():
+                                        weight = weights.get(name, 1.0/len(predictions))
+                                        y_pred += pred * weight
+                                        total_weight += weight
+                                    y_pred /= total_weight  # Normalize
+                                else:
+                                    # Simple average
+                                    y_pred = np.mean(list(predictions.values()), axis=0)
+                            else:
+                                # Single model
+                                y_pred = model.predict(X_test_scaled)[0]
+                            
+                            # Apply calibration if available
+                            if model_data.get('calibration_factors'):
+                                cal_factors = model_data['calibration_factors']
+                                for i in range(3):
+                                    y_pred[i] *= cal_factors[i]
+                            
+                            # Model info
+                            model_info = model_data.get('approach', 'Neural Network')
+                            
+                        else:
+                            # Original model without engineered features
+                            model = model_data['model']
+                            scaler = model_data['scaler']
+                            
+                            # Prepare features (sorted frequencies and amplitudes interleaved)
+                            features = []
+                            for i in range(5):
+                                features.extend([sorted_freqs[i], sorted_amps[i]])
+                            
+                            X_test = np.array([features])
+                            X_test_scaled = scaler.transform(X_test)
+                            
+                            # Predict
+                            y_pred = model.predict(X_test_scaled)[0]
+                            
+                            # Model info
+                            model_info = model_data.get('model_type', 'Unknown')
+                        
+                        # Calculate confidence
+                        non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
+                        confidence = min(95, 50 + non_zero_peaks * 9)
+                        
+                        st.session_state.inverse_results = {
+                            'a_mag': float(y_pred[0]),
+                            'b_mag': float(y_pred[1]),
+                            'c_mag': float(y_pred[2]),
+                            'confidence': confidence,
+                            'success': True,
+                            'model_info': model_info,
+                            'model_file': model_path
+                        }
+                        
+                        st.success(f"✅ Prediction complete using {model_info}")
+                        
+                    else:
+                        st.error("No model file found!")
+                        st.info("Please ensure the model file exists.")
+                        
+                except Exception as e:
+                    st.error(f"Error in prediction: {str(e)}")
+                    import traceback
+                    st.text(traceback.format_exc())
+        
+        # Results section
+        if st.session_state.inverse_results and st.session_state.inverse_results['success']:
+            st.markdown("### 📊 Results")
+            st.markdown("**Predicted State Magnitudes:**")
+            
+            # Show predicted magnitudes with comparison to forward values
+            pred_a = st.session_state.inverse_results['a_mag']
+            pred_b = st.session_state.inverse_results['b_mag']
+            pred_c = st.session_state.inverse_results['c_mag']
+            
+            if st.session_state.forward_magnitudes:
+                true_a = st.session_state.forward_magnitudes['a']
+                true_b = st.session_state.forward_magnitudes['b']
+                true_c = st.session_state.forward_magnitudes['c']
+                
+                # Display with comparison
+                st.markdown("**Magnitude Comparison:**")
+                col_pred, col_true, col_diff = st.columns(3)
+                
+                with col_pred:
+                    st.markdown("**Predicted:**")
+                    st.write(f"|a| = {pred_a:.3f}")
+                    st.write(f"|b| = {pred_b:.3f}")
+                    st.write(f"|c| = {pred_c:.3f}")
+                
+                with col_true:
+                    st.markdown("**True (Forward):**")
+                    st.write(f"|a| = {true_a:.3f}")
+                    st.write(f"|b| = {true_b:.3f}")
+                    st.write(f"|c| = {true_c:.3f}")
+                
+                with col_diff:
+                    st.markdown("**Error:**")
+                    st.write(f"Δ|a| = {abs(pred_a - true_a):.3f}")
+                    st.write(f"Δ|b| = {abs(pred_b - true_b):.3f}")
+                    st.write(f"Δ|c| = {abs(pred_c - true_c):.3f}")
+                
+                # Calculate relative errors
+                rel_error_a = abs(pred_a - true_a) / true_a * 100 if true_a > 0 else 0
+                rel_error_b = abs(pred_b - true_b) / true_b * 100 if true_b > 0 else 0
+                rel_error_c = abs(pred_c - true_c) / true_c * 100 if true_c > 0 else 0
+                avg_rel_error = (rel_error_a + rel_error_b + rel_error_c) / 3
+                
+                st.markdown(f"**Average Relative Error:** {avg_rel_error:.1f}%")
+                
+                # Show improvement message if error is now low
+                if avg_rel_error < 10:
+                    st.success("✅ Excellent prediction accuracy!")
+                elif avg_rel_error < 20:
+                    st.info("✓ Good prediction accuracy")
+            else:
+                # Just show predictions if no forward values
+                st.write(f"|a| = {pred_a:.3f}")
+                st.write(f"|b| = {pred_b:.3f}")
+                st.write(f"|c| = {pred_c:.3f}")
+            
+            st.write("")
+            st.write(f"**Model Confidence:** {st.session_state.inverse_results['confidence']}%")
+            
+            # Note about phase information
+            st.info("ℹ️ Note: The ML model predicts only magnitudes |a|, |b|, |c|. "
+                    "Phase information cannot be recovered from FFT peaks alone due to the "
+                    "loss of phase information in the power spectrum.")
+            
+            if st.button("📊 Show Comparison Plots", key="comparison"):
+                # Create comparison plots
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+                
+                # 1. Bar chart comparing magnitudes
+                if st.session_state.forward_magnitudes:
+                    labels = ['|a|', '|b|', '|c|']
+                    predicted = [pred_a, pred_b, pred_c]
+                    true_vals = [true_a, true_b, true_c]
+                    
+                    x = np.arange(len(labels))
+                    width = 0.35
+                    
+                    ax1.bar(x - width/2, true_vals, width, label='True', color='blue', alpha=0.7)
+                    ax1.bar(x + width/2, predicted, width, label='Predicted', color='green', alpha=0.7)
+                    ax1.set_ylabel('Magnitude')
+                    ax1.set_title('Magnitude Comparison')
+                    ax1.set_xticks(x)
+                    ax1.set_xticklabels(labels)
+                    ax1.legend()
+                    ax1.grid(True, alpha=0.3)
+                else:
+                    # Just show predicted if no true values
+                    labels = ['|a|', '|b|', '|c|']
+                    predicted = [pred_a, pred_b, pred_c]
+                    ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
+                    ax1.set_ylabel('Magnitude')
+                    ax1.set_title('Predicted State Magnitudes')
+                    ax1.set_ylim(0, max(predicted) * 1.2)
+                
+                # 2. Radar plot for state visualization
+                categories = ['|a|', '|b|', '|c|']
+                angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+                angles += angles[:1]  # Complete the circle
+                
+                predicted_radar = [pred_a, pred_b, pred_c]
+                predicted_radar += predicted_radar[:1]
+                
+                ax2 = plt.subplot(133, projection='polar')
+                ax2.plot(angles, predicted_radar, 'o-', linewidth=2, label='Predicted', color='green')
+                ax2.fill(angles, predicted_radar, alpha=0.25, color='green')
+                
+                if st.session_state.forward_magnitudes:
+                    true_radar = [true_a, true_b, true_c]
+                    true_radar += true_radar[:1]
+                    ax2.plot(angles, true_radar, 'o-', linewidth=2, label='True', color='blue')
+                    ax2.fill(angles, true_radar, alpha=0.25, color='blue')
+                
+                ax2.set_xticks(angles[:-1])
+                ax2.set_xticklabels(categories)
+                ax2.set_title('State Magnitude Profile')
+                ax2.legend()
+                
+                # 3. Confidence visualization
+                ax3.pie([st.session_state.inverse_results['confidence'], 
+                        100 - st.session_state.inverse_results['confidence']], 
+                       labels=['Confident', 'Uncertain'],
+                       colors=['green', 'lightgray'],
+                       startangle=90)
+                ax3.set_title('Prediction Confidence')
+                
+                plt.tight_layout()
+                st.pyplot(fig)
 
 # ==========================================
 # STREAMLIT APP MAIN STRUCTURE
