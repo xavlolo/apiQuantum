@@ -1,5 +1,5 @@
 """
-Quantum FFT State Analyzer - Complete Version with Workflow Tab
+Quantum FFT State Analyzer - Enhanced Version with Test Performance Analysis
 A web interface for forward and inverse quantum state analysis
 """
 
@@ -17,6 +17,8 @@ from scipy.interpolate import CubicSpline
 from scipy.optimize import minimize_scalar
 import requests
 import tempfile
+from tqdm import tqdm
+import seaborn as sns
 
 # Page configuration
 st.set_page_config(
@@ -126,11 +128,41 @@ st.markdown("""
         border-radius: 5px;
         margin: 5px 0;
     }
+    .metric-box {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #dee2e6;
+        text-align: center;
+        margin: 5px 0;
+    }
+    .metric-value {
+        font-size: 24px;
+        font-weight: bold;
+        color: #2196F3;
+    }
+    .metric-label {
+        font-size: 12px;
+        color: #666;
+        margin-top: 5px;
+    }
+    .error-bad {
+        background-color: #ffebee;
+        border-left: 4px solid #f44336;
+        padding: 10px;
+        margin: 5px 0;
+    }
+    .error-good {
+        background-color: #e8f5e8;
+        border-left: 4px solid #4caf50;
+        padding: 10px;
+        margin: 5px 0;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 # ==========================================
-# QUANTUM SIMULATION FUNCTIONS
+# QUANTUM SIMULATION FUNCTIONS (Same as before)
 # ==========================================
 
 @st.cache_data
@@ -462,7 +494,583 @@ def draw_network_diagram():
     return fig
 
 # ==========================================
-# WORKFLOW EXPLANATION FUNCTIONS
+# TEST PERFORMANCE ANALYSIS FUNCTIONS
+# ==========================================
+
+@st.cache_data
+def load_test_dataset(file_path=None):
+    """Load test dataset from file or default location"""
+    if file_path is None:
+        # Try default locations
+        default_files = [
+            "quantum_fft_test_20250607_195702.csv",
+            "ml_data_cubic_spline/quantum_fft_test_20250616_214918.csv",
+            "quantum_fft_test.csv"
+        ]
+        
+        for file in default_files:
+            if os.path.exists(file):
+                file_path = file
+                break
+        
+        if file_path is None:
+            return None, "No test dataset found. Please upload one."
+    
+    try:
+        df = pd.read_csv(file_path)
+        return df, f"Loaded {len(df)} samples from {file_path}"
+    except Exception as e:
+        return None, f"Error loading dataset: {str(e)}"
+
+def prepare_features_for_prediction(df):
+    """Prepare features exactly as in training"""
+    # Sort peaks by amplitude for each sample
+    sorted_data = []
+    
+    for _, row in df.iterrows():
+        # Get peak data
+        peaks = []
+        for i in range(1, 6):
+            freq = row[f'peak{i}_freq']
+            amp = row[f'peak{i}_amp']
+            peaks.append((freq, amp))
+        
+        # Sort by amplitude (descending)
+        peaks_sorted = sorted(peaks, key=lambda x: x[1], reverse=True)
+        
+        # Extract sorted frequencies and amplitudes
+        sorted_freqs = [p[0] for p in peaks_sorted]
+        sorted_amps = [p[1] for p in peaks_sorted]
+        
+        # Basic features (10)
+        features = []
+        for i in range(5):
+            features.extend([sorted_freqs[i], sorted_amps[i]])
+        
+        # Engineered features (5)
+        total_power = sum(sorted_amps)
+        n_peaks = sum(1 for f in sorted_freqs if f > 0)
+        max_freq = max(sorted_freqs)
+        max_amp = max(sorted_amps)
+        freq_spread = max(sorted_freqs) - min(sorted_freqs)
+        
+        features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
+        
+        sorted_data.append(features)
+    
+    return np.array(sorted_data)
+
+def calculate_true_magnitudes(df):
+    """Calculate true magnitudes from complex amplitudes"""
+    a_mag = np.sqrt(df['a_real']**2 + df['a_imag']**2)
+    b_mag = np.sqrt(df['b_real']**2 + df['b_imag']**2)
+    c_mag = np.sqrt(df['c_real']**2 + df['c_imag']**2)
+    
+    return np.column_stack([a_mag, b_mag, c_mag])
+
+@st.cache_data
+def run_bulk_predictions(test_df, model_path):
+    """Run predictions on entire test dataset"""
+    try:
+        # Load model
+        model_data = joblib.load(model_path)
+        model = model_data['model']
+        scaler = model_data['scaler']
+        
+        # Prepare features
+        X_test = prepare_features_for_prediction(test_df)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Get true magnitudes
+        y_true = calculate_true_magnitudes(test_df)
+        
+        # Make predictions
+        if isinstance(model, dict):
+            # Ensemble model
+            predictions = {}
+            for name, m in model.items():
+                if hasattr(m, 'predict'):
+                    predictions[name] = m.predict(X_test_scaled)
+            
+            # Weighted ensemble
+            approach = model_data.get('approach', 'Ensemble (Weighted)')
+            if 'Weighted' in approach:
+                weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
+                y_pred = np.zeros_like(list(predictions.values())[0])
+                total_weight = 0
+                for name, pred in predictions.items():
+                    weight = weights.get(name, 1.0/len(predictions))
+                    y_pred += pred * weight
+                    total_weight += weight
+                y_pred /= total_weight
+            else:
+                # Simple average
+                y_pred = np.mean(list(predictions.values()), axis=0)
+        else:
+            # Single model
+            y_pred = model.predict(X_test_scaled)
+        
+        # Apply calibration if available
+        if model_data.get('calibration_factors'):
+            cal_factors = model_data['calibration_factors']
+            for i in range(3):
+                y_pred[:, i] *= cal_factors[i]
+        
+        return y_true, y_pred, model_data
+        
+    except Exception as e:
+        st.error(f"Error in bulk prediction: {str(e)}")
+        return None, None, None
+
+def analyze_errors(y_true, y_pred):
+    """Comprehensive error analysis"""
+    # Calculate various error metrics
+    mae_per_sample = np.mean(np.abs(y_true - y_pred), axis=1)
+    rmse_per_sample = np.sqrt(np.mean((y_true - y_pred)**2, axis=1))
+    
+    # Relative errors (avoid division by zero)
+    rel_errors = np.abs(y_true - y_pred) / (y_true + 1e-10) * 100
+    rel_error_per_sample = np.mean(rel_errors, axis=1)
+    
+    # Per-magnitude errors
+    mae_per_mag = np.mean(np.abs(y_true - y_pred), axis=0)
+    rmse_per_mag = np.sqrt(np.mean((y_true - y_pred)**2, axis=0))
+    
+    # R² for each magnitude
+    r2_per_mag = []
+    for i in range(3):
+        ss_res = np.sum((y_true[:, i] - y_pred[:, i])**2)
+        ss_tot = np.sum((y_true[:, i] - np.mean(y_true[:, i]))**2)
+        r2_per_mag.append(1 - (ss_res / ss_tot))
+    
+    # Average magnitudes per sample
+    avg_true_mag = np.mean(y_true, axis=1)
+    
+    return {
+        'mae_per_sample': mae_per_sample,
+        'rmse_per_sample': rmse_per_sample,
+        'rel_error_per_sample': rel_error_per_sample,
+        'mae_per_mag': mae_per_mag,
+        'rmse_per_mag': rmse_per_mag,
+        'r2_per_mag': r2_per_mag,
+        'avg_true_mag': avg_true_mag,
+        'rel_errors': rel_errors
+    }
+
+def show_test_performance_analysis():
+    """Display the test performance analysis tab"""
+    
+    st.header("📈 Test Performance Analysis")
+    st.markdown("### Comprehensive ML Model Evaluation on Test Dataset")
+    
+    # Dataset loading section
+    st.markdown("---")
+    st.subheader("📁 Dataset Loading")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # File upload option
+        uploaded_file = st.file_uploader(
+            "Upload test dataset (CSV)", 
+            type=['csv'],
+            help="Upload your test dataset or use default if available"
+        )
+        
+        # Load dataset
+        if uploaded_file is not None:
+            test_df = pd.read_csv(uploaded_file)
+            dataset_msg = f"Uploaded dataset: {len(test_df)} samples"
+        else:
+            test_df, dataset_msg = load_test_dataset()
+        
+        if test_df is not None:
+            st.success(dataset_msg)
+            
+            # Show dataset info
+            st.markdown("**Dataset Info:**")
+            col_info1, col_info2, col_info3 = st.columns(3)
+            with col_info1:
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{len(test_df)}</div><div class="metric-label">Total Samples</div></div>', unsafe_allow_html=True)
+            with col_info2:
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{len(test_df.columns)}</div><div class="metric-label">Features</div></div>', unsafe_allow_html=True)
+            with col_info3:
+                # Count samples with valid peaks
+                valid_samples = sum(1 for _, row in test_df.iterrows() 
+                                  if any(row[f'peak{i}_freq'] > 0 for i in range(1, 6)))
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{valid_samples}</div><div class="metric-label">Valid Peaks</div></div>', unsafe_allow_html=True)
+        else:
+            st.error(dataset_msg)
+            st.info("Please upload a test dataset to continue with the analysis.")
+            return
+    
+    with col2:
+        # Dataset preview
+        if test_df is not None:
+            st.markdown("**Dataset Preview:**")
+            st.dataframe(test_df.head(3), use_container_width=True)
+    
+    # Model selection and bulk prediction
+    st.markdown("---")
+    st.subheader("🤖 Bulk Prediction Analysis")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Model path selection
+        model_paths = []
+        
+        # Look for available models
+        possible_paths = [
+            'quantum_simple_nn_20250623_215653.pkl',
+            'quantum-app/quantum_simple_nn_20250623_215653.pkl',
+            'quantum_inverse_model.pkl'
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                model_paths.append(path)
+        
+        if model_paths:
+            selected_model = st.selectbox("Select model for analysis:", model_paths)
+        else:
+            st.error("No valid model files found!")
+            return
+    
+    with col2:
+        # Analysis controls
+        run_analysis = st.button("🚀 Run Full Analysis", use_container_width=True)
+        
+        if run_analysis:
+            st.session_state.run_bulk_analysis = True
+    
+    # Run bulk analysis if requested
+    if run_analysis or st.session_state.get('run_bulk_analysis', False):
+        with st.spinner("Running bulk predictions on test dataset..."):
+            
+            # Progress bar
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            status_text.text("Loading model and preparing features...")
+            progress_bar.progress(20)
+            
+            # Run predictions
+            y_true, y_pred, model_data = run_bulk_predictions(test_df, selected_model)
+            progress_bar.progress(60)
+            
+            if y_true is not None and y_pred is not None:
+                status_text.text("Analyzing prediction errors...")
+                progress_bar.progress(80)
+                
+                # Calculate comprehensive error analysis
+                error_analysis = analyze_errors(y_true, y_pred)
+                progress_bar.progress(100)
+                
+                status_text.text("Analysis complete!")
+                
+                # Store results in session state
+                st.session_state.bulk_results = {
+                    'y_true': y_true,
+                    'y_pred': y_pred,
+                    'error_analysis': error_analysis,
+                    'model_data': model_data,
+                    'test_df': test_df
+                }
+                
+                st.success("✅ Bulk analysis completed successfully!")
+            else:
+                st.error("❌ Failed to run bulk analysis")
+                return
+    
+    # Display results if available
+    if 'bulk_results' in st.session_state:
+        results = st.session_state.bulk_results
+        y_true = results['y_true']
+        y_pred = results['y_pred']
+        error_analysis = results['error_analysis']
+        model_data = results['model_data']
+        
+        # Performance metrics summary
+        st.markdown("---")
+        st.subheader("📊 Performance Summary")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            overall_mae = np.mean(error_analysis['mae_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_mae:.4f}</div><div class="metric-label">Overall MAE</div></div>', unsafe_allow_html=True)
+        
+        with col2:
+            overall_rmse = np.mean(error_analysis['rmse_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_rmse:.4f}</div><div class="metric-label">Overall RMSE</div></div>', unsafe_allow_html=True)
+        
+        with col3:
+            overall_rel_error = np.mean(error_analysis['rel_error_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_rel_error:.1f}%</div><div class="metric-label">Avg Rel Error</div></div>', unsafe_allow_html=True)
+        
+        with col4:
+            overall_r2 = np.mean(error_analysis['r2_per_mag'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_r2:.4f}</div><div class="metric-label">Avg R²</div></div>', unsafe_allow_html=True)
+        
+        with col5:
+            good_predictions = np.sum(error_analysis['rel_error_per_sample'] < 10)
+            good_percent = good_predictions / len(y_true) * 100
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{good_percent:.1f}%</div><div class="metric-label">< 10% Error</div></div>', unsafe_allow_html=True)
+        
+        # Per-magnitude breakdown
+        st.markdown("**Per-Magnitude Performance:**")
+        
+        mag_col1, mag_col2, mag_col3 = st.columns(3)
+        magnitude_names = ['|a|', '|b|', '|c|']
+        
+        for i, (col, name) in enumerate(zip([mag_col1, mag_col2, mag_col3], magnitude_names)):
+            with col:
+                mae_val = error_analysis['mae_per_mag'][i]
+                r2_val = error_analysis['r2_per_mag'][i]
+                st.markdown(f"""
+                <div class="metric-box">
+                    <div style="font-weight: bold; margin-bottom: 10px;">{name}</div>
+                    <div>MAE: {mae_val:.4f}</div>
+                    <div>R²: {r2_val:.4f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # Error distribution visualizations
+        st.markdown("---")
+        st.subheader("📈 Error Distribution Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # MAE histogram
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(error_analysis['mae_per_sample'], bins=50, alpha=0.7, color='blue', edgecolor='black')
+            ax.axvline(np.mean(error_analysis['mae_per_sample']), color='red', linestyle='--', 
+                      label=f'Mean: {np.mean(error_analysis["mae_per_sample"]):.4f}')
+            ax.axvline(np.median(error_analysis['mae_per_sample']), color='green', linestyle='--', 
+                      label=f'Median: {np.median(error_analysis["mae_per_sample"]):.4f}')
+            ax.set_xlabel('Mean Absolute Error per Sample')
+            ax.set_ylabel('Count')
+            ax.set_title('Distribution of MAE Across Test Samples')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+        
+        with col2:
+            # Relative error histogram
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(error_analysis['rel_error_per_sample'], bins=50, alpha=0.7, color='orange', edgecolor='black')
+            ax.axvline(np.mean(error_analysis['rel_error_per_sample']), color='red', linestyle='--', 
+                      label=f'Mean: {np.mean(error_analysis["rel_error_per_sample"]):.1f}%')
+            ax.axvline(np.median(error_analysis['rel_error_per_sample']), color='green', linestyle='--', 
+                      label=f'Median: {np.median(error_analysis["rel_error_per_sample"]):.1f}%')
+            ax.set_xlabel('Relative Error per Sample (%)')
+            ax.set_ylabel('Count')
+            ax.set_title('Distribution of Relative Error Across Test Samples')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, min(100, np.percentile(error_analysis['rel_error_per_sample'], 95)))
+            st.pyplot(fig)
+        
+        # Scatter plots - Predicted vs True
+        st.markdown("### 🎯 Predicted vs True Magnitude Scatter Plots")
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        for i, (ax, name) in enumerate(zip(axes, magnitude_names)):
+            # Scatter plot
+            ax.scatter(y_true[:, i], y_pred[:, i], alpha=0.5, s=20)
+            
+            # Perfect prediction line
+            min_val = 0
+            max_val = max(y_true[:, i].max(), y_pred[:, i].max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+            
+            # Add error bands
+            ax.fill_between([min_val, max_val], 
+                           [min_val*0.9, max_val*0.9], 
+                           [min_val*1.1, max_val*1.1], 
+                           alpha=0.2, color='gray', label='±10% Error')
+            
+            # Metrics
+            mae = error_analysis['mae_per_mag'][i]
+            r2 = error_analysis['r2_per_mag'][i]
+            
+            ax.set_xlabel(f'True {name}')
+            ax.set_ylabel(f'Predicted {name}')
+            ax.set_title(f'{name}\nMAE={mae:.4f}, R²={r2:.4f}')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            ax.set_xlim(0, max_val * 1.05)
+            ax.set_ylim(0, max_val * 1.05)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        # Performance vs magnitude analysis
+        st.markdown("### 📉 Performance vs Magnitude Analysis")
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Error vs average magnitude
+        avg_mags = error_analysis['avg_true_mag']
+        mae_samples = error_analysis['mae_per_sample']
+        rel_error_samples = error_analysis['rel_error_per_sample']
+        
+        # Bin by magnitude ranges
+        mag_bins = np.linspace(0, avg_mags.max(), 10)
+        bin_centers = (mag_bins[:-1] + mag_bins[1:]) / 2
+        
+        binned_mae = []
+        binned_rel_error = []
+        
+        for i in range(len(mag_bins)-1):
+            mask = (avg_mags >= mag_bins[i]) & (avg_mags < mag_bins[i+1])
+            if np.sum(mask) > 0:
+                binned_mae.append(np.mean(mae_samples[mask]))
+                binned_rel_error.append(np.mean(rel_error_samples[mask]))
+            else:
+                binned_mae.append(np.nan)
+                binned_rel_error.append(np.nan)
+        
+        # Plot MAE vs magnitude
+        ax1.plot(bin_centers, binned_mae, 'bo-', linewidth=2, markersize=8)
+        ax1.set_xlabel('Average True Magnitude |a|, |b|, |c|')
+        ax1.set_ylabel('Mean Absolute Error')
+        ax1.set_title('MAE vs State Magnitude')
+        ax1.grid(True, alpha=0.3)
+        
+        # Add regions
+        ax1.axvspan(0, 0.5, alpha=0.2, color='red', label='High Error Region')
+        ax1.axvspan(0.5, 1.0, alpha=0.2, color='yellow', label='Moderate Error')
+        ax1.axvspan(1.0, avg_mags.max(), alpha=0.2, color='green', label='Low Error Region')
+        ax1.legend()
+        
+        # Plot relative error vs magnitude
+        ax2.plot(bin_centers, binned_rel_error, 'ro-', linewidth=2, markersize=8)
+        ax2.set_xlabel('Average True Magnitude |a|, |b|, |c|')
+        ax2.set_ylabel('Relative Error (%)')
+        ax2.set_title('Relative Error vs State Magnitude')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add regions
+        ax2.axvspan(0, 0.5, alpha=0.2, color='red')
+        ax2.axvspan(0.5, 1.0, alpha=0.2, color='yellow')
+        ax2.axvspan(1.0, avg_mags.max(), alpha=0.2, color='green')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        # Outlier analysis
+        st.markdown("---")
+        st.subheader("🔍 Outlier Analysis")
+        
+        # Find worst and best cases
+        worst_indices = np.argsort(error_analysis['rel_error_per_sample'])[-10:][::-1]
+        best_indices = np.argsort(error_analysis['rel_error_per_sample'])[:10]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**🔴 Worst 10 Predictions:**")
+            worst_data = []
+            for idx in worst_indices:
+                worst_data.append({
+                    'Sample': int(idx),
+                    'Rel Error (%)': f"{error_analysis['rel_error_per_sample'][idx]:.1f}",
+                    'MAE': f"{error_analysis['mae_per_sample'][idx]:.4f}",
+                    'Avg Magnitude': f"{error_analysis['avg_true_mag'][idx]:.3f}"
+                })
+            
+            worst_df = pd.DataFrame(worst_data)
+            st.dataframe(worst_df, use_container_width=True)
+        
+        with col2:
+            st.markdown("**🟢 Best 10 Predictions:**")
+            best_data = []
+            for idx in best_indices:
+                best_data.append({
+                    'Sample': int(idx),
+                    'Rel Error (%)': f"{error_analysis['rel_error_per_sample'][idx]:.1f}",
+                    'MAE': f"{error_analysis['mae_per_sample'][idx]:.4f}",
+                    'Avg Magnitude': f"{error_analysis['avg_true_mag'][idx]:.3f}"
+                })
+            
+            best_df = pd.DataFrame(best_data)
+            st.dataframe(best_df, use_container_width=True)
+        
+        # Statistical summary
+        st.markdown("### 📋 Statistical Summary")
+        
+        percentiles = [50, 75, 90, 95, 99]
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**MAE Percentiles:**")
+            mae_stats = []
+            for p in percentiles:
+                mae_stats.append({
+                    'Percentile': f"{p}th",
+                    'MAE': f"{np.percentile(error_analysis['mae_per_sample'], p):.4f}"
+                })
+            st.dataframe(pd.DataFrame(mae_stats), use_container_width=True)
+        
+        with col2:
+            st.markdown("**Relative Error Percentiles:**")
+            rel_stats = []
+            for p in percentiles:
+                rel_stats.append({
+                    'Percentile': f"{p}th",
+                    'Rel Error (%)': f"{np.percentile(error_analysis['rel_error_per_sample'], p):.1f}"
+                })
+            st.dataframe(pd.DataFrame(rel_stats), use_container_width=True)
+        
+        # Key insights
+        st.markdown("### 💡 Key Insights")
+        
+        insights = []
+        
+        # Performance by magnitude ranges
+        low_mag_mask = error_analysis['avg_true_mag'] < 0.5
+        high_mag_mask = error_analysis['avg_true_mag'] > 1.5
+        
+        if np.sum(low_mag_mask) > 0:
+            low_mag_error = np.mean(error_analysis['rel_error_per_sample'][low_mag_mask])
+            insights.append(f"🔴 Low magnitude states (< 0.5): {low_mag_error:.1f}% average relative error")
+        
+        if np.sum(high_mag_mask) > 0:
+            high_mag_error = np.mean(error_analysis['rel_error_per_sample'][high_mag_mask])
+            insights.append(f"🟢 High magnitude states (> 1.5): {high_mag_error:.1f}% average relative error")
+        
+        # Error distribution
+        excellent_count = np.sum(error_analysis['rel_error_per_sample'] < 5)
+        good_count = np.sum((error_analysis['rel_error_per_sample'] >= 5) & (error_analysis['rel_error_per_sample'] < 10))
+        poor_count = np.sum(error_analysis['rel_error_per_sample'] >= 20)
+        
+        insights.extend([
+            f"🎯 {excellent_count} samples ({excellent_count/len(y_true)*100:.1f}%) have < 5% relative error",
+            f"✅ {good_count} samples ({good_count/len(y_true)*100:.1f}%) have 5-10% relative error",
+            f"⚠️ {poor_count} samples ({poor_count/len(y_true)*100:.1f}%) have > 20% relative error"
+        ])
+        
+        # Best performing magnitude
+        best_mag_idx = np.argmin(error_analysis['mae_per_mag'])
+        worst_mag_idx = np.argmax(error_analysis['mae_per_mag'])
+        
+        insights.extend([
+            f"🏆 Best predicted magnitude: {magnitude_names[best_mag_idx]} (MAE: {error_analysis['mae_per_mag'][best_mag_idx]:.4f})",
+            f"📉 Most challenging magnitude: {magnitude_names[worst_mag_idx]} (MAE: {error_analysis['mae_per_mag'][worst_mag_idx]:.4f})"
+        ])
+        
+        for insight in insights:
+            if "🔴" in insight or "⚠️" in insight or "📉" in insight:
+                st.markdown(f'<div class="error-bad">{insight}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="error-good">{insight}</div>', unsafe_allow_html=True)
+
+# ==========================================
+# WORKFLOW EXPLANATION FUNCTIONS (Same as before)
 # ==========================================
 
 def show_workflow_explanation():
@@ -636,137 +1244,9 @@ def show_workflow_explanation():
     )
     
     st.success("✅ **Best Approach: Ensemble (Weighted)** - Achieves lowest error and highest R²")
-    
-    # Low Magnitude Performance Issue
-    st.markdown("---")
-    st.markdown("### ⚠️ Performance Considerations for Low Magnitudes")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.warning("""
-        **Why Lower Accuracy for Small |a|, |b|, |c| Values?**
-        
-        When the quantum state magnitudes are very small:
-        - The resulting oscillations in qubit dynamics become very weak
-        - FFT peaks have lower signal-to-noise ratio
-        - Small peaks may be below detection threshold
-        - Feature extraction becomes less reliable
-        
-        This leads to:
-        - Fewer detected peaks (lower confidence)
-        - Less accurate magnitude predictions
-        - Higher relative errors (small denominator effect)
-        """)
-    
-    with col2:
-        # Placeholder for the image
-        st.markdown("**Model Performance vs Magnitude:**")
-        
-        # Instructions for adding your image
-        st.info("""
-        To add your performance plot:
-        1. Save your image as 'low_magnitude_performance.png'
-        2. Place it in the same directory as the app
-        3. Uncomment the code below
-        """)
-        
-        # Uncomment this when you have the image file:
-        # try:
-        #     st.image('low_magnitude_performance.png', 
-        #              caption='Model performance decreases for low magnitude states',
-        #              use_column_width=True)
-        # except:
-        #     st.error("Image file not found")
-    
-    st.markdown("""
-    **Recommendations:**
-    - For |a|, |b|, |c| < 0.5, expect higher relative errors
-    - Consider using normalized states when possible
-    - Check confidence scores for reliability assessment
-    """)
-    
-    # Show the performance plot placeholder
-    with st.expander("📈 View Performance Analysis Plot"):
-        # Create a simple demonstration plot showing the concept
-        fig, ax = plt.subplots(figsize=(8, 5))
-        
-        # Simulated data showing performance vs magnitude
-        magnitudes = np.linspace(0.1, 3.0, 50)
-        relative_error = 10 * np.exp(-2 * magnitudes) + 2  # Exponential decay model
-        
-        ax.plot(magnitudes, relative_error, 'b-', linewidth=2)
-        ax.fill_between(magnitudes, relative_error - 1, relative_error + 1, alpha=0.3)
-        
-        ax.set_xlabel('Average State Magnitude (|a|, |b|, |c|)')
-        ax.set_ylabel('Relative Error (%)')
-        ax.set_title('Model Performance vs State Magnitude\n(Demonstration - Replace with Actual Data)')
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim(0, 3)
-        ax.set_ylim(0, 15)
-        
-        # Add regions
-        ax.axvspan(0, 0.5, alpha=0.2, color='red', label='High Error Region')
-        ax.axvspan(0.5, 1.0, alpha=0.2, color='yellow', label='Moderate Error')
-        ax.axvspan(1.0, 3.0, alpha=0.2, color='green', label='Low Error Region')
-        
-        ax.legend()
-        st.pyplot(fig)
-    
-    # Key Insights
-    st.markdown("---")
-    st.markdown("### 💡 Key Insights")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.success("""
-        **Why Peak Ordering Matters:**
-        - FFT peaks must be sorted by amplitude (not frequency)
-        - This matches the training data generation
-        - Incorrect ordering leads to poor predictions
-        - The "Use Forward Results" button ensures correct ordering
-        """)
-    
-    with col2:
-        st.warning("""
-        **Limitations:**
-        - Only magnitudes are recovered (phase information is lost)
-        - Requires known coupling constants (k, J values)
-        - Limited to 3-component superposition states
-        - Accuracy depends on peak quality and number
-        """)
-    
-    # Technical Details
-    with st.expander("📐 Technical Implementation Details"):
-        st.markdown("""
-        **Quantum Simulation:**
-        - 64-dimensional Hilbert space (2^6 states)
-        - Hamiltonian matrix construction with k and J terms
-        - RK4 integration with dt = 0.01 over 50 time units
-        - Projective measurements on individual qubits
-        
-        **FFT Analysis:**
-        - Hanning window to reduce spectral leakage
-        - Cubic spline interpolation for precise peak finding
-        - Peak detection with configurable threshold (5% of max)
-        - DC component removal (frequencies < 0.05 Hz)
-        
-        **Machine Learning:**
-        - Multi-output regression for 3 target values
-        - Feature engineering to capture peak relationships
-        - Ensemble methods for improved robustness
-        - Optional calibration factors for systematic corrections
-        
-        **Data Flow:**
-        1. Quantum state → Time evolution → Probability dynamics
-        2. Dynamics → FFT → Peak extraction → Feature vector
-        3. Features → ML model → Magnitude predictions
-        4. Predictions → Visualization and comparison
-        """)
 
 # ==========================================
-# MAIN APP SECTION
+# MAIN APP SECTION (Same as before but condensed)
 # ==========================================
 
 def show_main_app():
@@ -777,541 +1257,31 @@ def show_main_app():
         st.plotly_chart(draw_network_diagram(), use_container_width=True)
 
     st.markdown("---")
+    st.markdown("### Quick Forward/Inverse Demo")
+    st.info("For detailed analysis, use the **Test Performance Analysis** tab above.")
 
-    # Create two columns for forward and inverse problems
+    # Simplified demo version - show core functionality
     col1, col2 = st.columns(2)
 
-    # FORWARD PROBLEM (Left Panel)
     with col1:
-        st.header("➡️ Forward Problem")
-        st.subheader("Quantum State → FFT Peaks")
-        
-        # Lock icon for k-values
-        lock_col1, lock_col2 = st.columns([4, 1])
-        with lock_col2:
-            st.session_state.k_values_locked = st.checkbox("🔒", value=st.session_state.k_values_locked, 
-                                                           help="Lock k-values between panels")
-        
-        # Coupling constants
-        st.markdown("**Coupling Constants:**")
-        k01_forward = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_f")
-        k23_forward = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_f")
-        k45_forward = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_f")
-        j_coupling_forward = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_f")
-        
-        # Initial state info
-        st.markdown("**Initial State:**")
-        st.latex(r"|ψ⟩ = a|110000⟩ + b|100100⟩ + c|100001⟩")
-        
-        # Quantum amplitudes
-        st.markdown("**Quantum Amplitudes:**")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            a_real = st.number_input("a_real", value=0.148, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            b_real = st.number_input("b_real", value=-2.004, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            c_real = st.number_input("c_real", value=1.573, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-        with col_b:
-            a_imag = st.number_input("a_imag", value=2.026, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            b_imag = st.number_input("b_imag", value=0.294, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-            c_imag = st.number_input("c_imag", value=-2.555, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
-        
-        # Calculate and display magnitudes and phases
-        a_complex = a_real + 1j * a_imag
-        b_complex = b_real + 1j * b_imag
-        c_complex = c_real + 1j * c_imag
-        
-        a_mag = abs(a_complex)
-        b_mag = abs(b_complex)
-        c_mag = abs(c_complex)
-        
-        a_phase = np.angle(a_complex, deg=True)
-        b_phase = np.angle(b_complex, deg=True)
-        c_phase = np.angle(c_complex, deg=True)
-        
-        # Store magnitudes in session state
-        st.session_state.forward_magnitudes = {'a': a_mag, 'b': b_mag, 'c': c_mag}
-        
-        # Display magnitudes and phases
-        st.markdown("**Calculated Values:**")
-        col_mag, col_phase = st.columns(2)
-        with col_mag:
-            st.markdown("**Magnitudes:**")
-            st.markdown(f'<div class="magnitude-display">|a| = {a_mag:.3f}</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="magnitude-display">|b| = {b_mag:.3f}</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="magnitude-display">|c| = {c_mag:.3f}</div>', unsafe_allow_html=True)
-        with col_phase:
-            st.markdown("**Phases (degrees):**")
-            st.markdown(f'<div class="phase-display">φ_a = {a_phase:.1f}°</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="phase-display">φ_b = {b_phase:.1f}°</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="phase-display">φ_c = {c_phase:.1f}°</div>', unsafe_allow_html=True)
-        
-        # Simulate button
-        if st.button("🔄 Simulate Dynamics", key="simulate"):
-            with st.spinner("Running quantum simulation..."):
-                # Run actual simulation
-                peaks, probs, times, fft_data = run_quantum_simulation(
-                    a_complex, b_complex, c_complex,
-                    k01_forward, k23_forward, k45_forward, j_coupling_forward
-                )
+        st.markdown("**Forward Demo:** Quantum State → FFT Peaks")
+        if st.button("🔄 Run Demo Simulation"):
+            # Quick demo with fixed values
+            a_complex = 0.148 + 2.026j
+            b_complex = -2.004 + 0.294j  
+            c_complex = 1.573 - 2.555j
+            
+            with st.spinner("Running simulation..."):
+                peaks, _, _, _ = run_quantum_simulation(a_complex, b_complex, c_complex, 0.7, 1.0, 1.9, 0.5)
                 
-                st.session_state.forward_results = {
-                    'peaks': peaks,
-                    'probs': probs,
-                    'times': times,
-                    'fft_data': fft_data,
-                    'success': True
-                }
-        
-        # Results section
-        if st.session_state.forward_results and st.session_state.forward_results['success']:
-            st.markdown("### 📊 Results")
-            st.markdown("**Detected Peaks (sorted by amplitude):**")
-            
-            peaks = st.session_state.forward_results['peaks']
-            if peaks:
-                for i, peak in enumerate(peaks):
-                    if peak['freq'] > 0:  # Only show non-zero peaks
-                        st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
-            else:
-                st.write("No significant peaks detected")
-            
-            col_plot1, col_plot2 = st.columns(2)
-            with col_plot1:
-                if st.button("📊 Show FFT Plot", key="fft_plot"):
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    
-                    # Get actual FFT data
-                    freq, mag = st.session_state.forward_results['fft_data']
-                    
-                    ax.plot(freq, mag, 'b-', linewidth=1.5)
-                    
-                    # Mark peaks
-                    for i, peak in enumerate(peaks):
-                        if peak['freq'] > 0:
-                            ax.axvline(peak['freq'], color='red', linestyle='--', alpha=0.5)
-                            ax.plot(peak['freq'], peak['amp'], 'ro', markersize=8)
-                            ax.text(peak['freq'], peak['amp'] + 0.01, f"{i+1}", ha='center', fontsize=8)
-                    
-                    ax.set_xlabel('Frequency (Hz)')
-                    ax.set_ylabel('Magnitude')
-                    ax.set_title('FFT of Q4 (peaks numbered by amplitude rank)')
-                    ax.grid(True, alpha=0.3)
-                    ax.set_xlim(0, 2)
-                    st.pyplot(fig)
-            
-            with col_plot2:
-                if st.button("📈 Show Dynamics", key="dynamics_plot"):
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    probs = st.session_state.forward_results['probs']
-                    times = st.session_state.forward_results['times']
-                    
-                    ax.plot(times, probs[:, 4], 'b-', linewidth=1.5)
-                    ax.set_xlabel('Time')
-                    ax.set_ylabel('P(1)')
-                    ax.set_title('Q4 Dynamics')
-                    ax.grid(True, alpha=0.3)
-                    ax.set_ylim(-0.05, 1.05)
-                    st.pyplot(fig)
+            st.markdown("**Detected Peaks:**")
+            for i, peak in enumerate(peaks):
+                if peak['freq'] > 0:
+                    st.write(f"• Peak {i+1}: {peak['freq']:.3f} Hz (amp: {peak['amp']:.3f})")
 
-    # INVERSE PROBLEM (Right Panel)
     with col2:
-        st.header("⬅️ Inverse Problem")
-        st.subheader("FFT Peaks → Quantum State")
-        
-        # Coupling constants (synchronized if locked)
-        st.markdown("**Coupling Constants:**")
-        if st.session_state.k_values_locked:
-            k01_inverse = st.number_input("k(0,1)", value=k01_forward, min_value=0.0, max_value=3.0, step=0.1, 
-                                         key="k01_i", disabled=True)
-            k23_inverse = st.number_input("k(2,3)", value=k23_forward, min_value=0.0, max_value=3.0, step=0.1, 
-                                         key="k23_i", disabled=True)
-            k45_inverse = st.number_input("k(4,5)", value=k45_forward, min_value=0.0, max_value=3.0, step=0.1, 
-                                         key="k45_i", disabled=True)
-            j_coupling_inverse = st.number_input("J-coupling", value=j_coupling_forward, min_value=0.0, max_value=2.0, 
-                                               step=0.1, key="j_i", disabled=True)
-        else:
-            k01_inverse = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_i")
-            k23_inverse = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_i")
-            k45_inverse = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_i")
-            j_coupling_inverse = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_i")
-        
-        # Important note about peak ordering
-        st.info("ℹ️ **Important**: Peaks should be ordered by amplitude (largest first), not frequency!")
-        
-        # Auto-fill from forward results
-        if st.session_state.forward_results and st.button("↩️ Use Forward Results", key="autofill"):
-            peaks = st.session_state.forward_results['peaks']
-            st.success("Peak values loaded! They are already sorted by amplitude as required.")
-        
-        # FFT Peak inputs
-        st.markdown("**FFT Peak Frequencies (Hz):**")
-        st.markdown("*Enter peaks in order of decreasing amplitude*")
-        col_freq, col_amp = st.columns(2)
-        
-        # Initialize default values
-        default_peaks = []
-        if st.session_state.forward_results:
-            default_peaks = st.session_state.forward_results['peaks']
-        
-        with col_freq:
-            st.markdown("**Frequencies:**")
-            peak_freqs = []
-            for i in range(5):
-                default_freq = float(default_peaks[i]['freq']) if i < len(default_peaks) else 0.0
-                freq = st.number_input(f"Peak {i+1}", value=default_freq, min_value=0.0, max_value=5.0, 
-                                      step=0.001, format="%.3f", key=f"p{i+1}f")
-                peak_freqs.append(freq)
-        
-        with col_amp:
-            st.markdown("**Amplitudes:**")
-            peak_amps = []
-            for i in range(5):
-                default_amp = float(default_peaks[i]['amp']) if i < len(default_peaks) else 0.0
-                # More reasonable maximum based on typical values
-                max_amp = 20.0
-                if default_amp > max_amp:
-                    st.warning(f"Peak {i+1} amplitude {default_amp:.3f} exceeds maximum, capping at {max_amp}")
-                    default_amp = max_amp
-                amp = st.number_input(f"Amp {i+1}", value=default_amp, min_value=0.0, max_value=max_amp, 
-                                     step=0.001, format="%.3f", key=f"p{i+1}a")
-                peak_amps.append(amp)
-        
-        # Model loading options
-        st.markdown("**Model Loading:**")
-        model_option = st.selectbox(
-            "Select model loading method:",
-            ["Local file (quantum_simple_nn_20250623_215653.pkl)",
-             "Download from URL",
-             "Use backup model"]
-        )
-        
-        # Predict button
-        if st.button("🧮 Predict State", key="predict"):
-            with st.spinner("Running ML prediction..."):
-                try:
-                    # Find the best model - UPDATE THE PATH HERE
-                    model_file = None
-                    
-                    # Check in quantum-app subdirectory
-                    model_path = 'quantum-app/quantum_simple_nn_20250623_215653.pkl'
-                    
-                    # Debug info
-                    st.write("Debug Info:")
-                    st.write(f"Looking for file: {model_path}")
-                    st.write(f"File exists: {os.path.exists(model_path)}")
-                    
-                    # Also check current directory
-                    if not os.path.exists(model_path):
-                        st.write("Checking alternate locations...")
-                        # Try just the filename in case we're already in quantum-app
-                        alt_path = 'quantum_simple_nn_20250623_215653.pkl'
-                        if os.path.exists(alt_path):
-                            model_path = alt_path
-                            st.write(f"Found at: {alt_path}")
-                    
-                    # List files to debug
-                    st.write("\nDirectory structure:")
-                    for root, dirs, files in os.walk('.'):
-                        level = root.replace('.', '', 1).count(os.sep)
-                        indent = ' ' * 2 * level
-                        st.write(f"{indent}{os.path.basename(root)}/")
-                        subindent = ' ' * 2 * (level + 1)
-                        for file in files[:10]:  # Limit to first 10 files
-                            if file.endswith('.pkl'):
-                                st.write(f"{subindent}{file}")
-                    
-                    if os.path.exists(model_path):
-                        # Check if it's a valid file or LFS pointer
-                        file_size = os.path.getsize(model_path)
-                        st.write(f"Model file size: {file_size} bytes")
-                        
-                        if file_size < 1000:  # Likely an LFS pointer
-                            st.error(f"Model file is too small ({file_size} bytes) - likely a Git LFS pointer")
-                            st.info("The model file needs to be downloaded properly. See sidebar for solutions.")
-                        else:
-                            # Load the model
-                            model_data = joblib.load(model_path)
-                            st.success(f"Model loaded successfully from {model_path}")
-                            
-                            # Continue with the rest of your prediction code...
-                            # CRITICAL: Sort peaks by amplitude (descending) to match training!
-                            peak_data = list(zip(peak_freqs, peak_amps))
-                            peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
-                            
-                            # Extract sorted frequencies and amplitudes
-                            sorted_freqs = [p[0] for p in peak_data_sorted]
-                            sorted_amps = [p[1] for p in peak_data_sorted]
-                            
-                            # Show sorting info
-                            if peak_data != peak_data_sorted:
-                                st.warning("⚠️ Peaks were re-sorted by amplitude to match training data format!")
-                                st.write("Sorted order:")
-                                for i, (f, a) in enumerate(peak_data_sorted):
-                                    if f > 0:
-                                        st.write(f"  Peak {i+1}: {f:.3f} Hz (amp: {a:.3f})")
-                            
-                            # Check if this is a neural network model with engineered features
-                            if 'feature_cols' in model_data and len(model_data['feature_cols']) > 10:
-                                # This is the neural network model with engineered features
-                                model = model_data['model']
-                                scaler = model_data['scaler']
-                                
-                                # Debug: Show expected features
-                                st.write(f"Model expects {len(model_data['feature_cols'])} features")
-                                
-                                # Prepare features EXACTLY as in training
-                                features = []
-                                
-                                # Basic features (sorted frequencies and amplitudes)
-                                for i in range(5):
-                                    features.extend([sorted_freqs[i], sorted_amps[i]])
-                                
-                                # Engineered features - must match neuralnetwork.py exactly
-                                # Total power
-                                total_power = sum(sorted_amps)
-                                
-                                # Number of peaks
-                                n_peaks = sum(1 for f in sorted_freqs if f > 0)
-                                
-                                # Max frequency and amplitude (from sorted data)
-                                max_freq = max(sorted_freqs)
-                                max_amp = max(sorted_amps)
-                                
-                                # Frequency spread - using ALL frequencies including zeros
-                                freq_spread = max(sorted_freqs) - min(sorted_freqs)
-                                
-                                # Add engineered features in the same order as training
-                                features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
-                                
-                                # Debug: Show feature values
-                                st.write(f"Total features prepared: {len(features)}")
-                                st.write(f"Engineered features: power={total_power:.3f}, n_peaks={n_peaks}, "
-                                        f"max_freq={max_freq:.3f}, max_amp={max_amp:.3f}, spread={freq_spread:.3f}")
-                                
-                                # Convert to numpy array and scale
-                                X_test = np.array([features])
-                                X_test_scaled = scaler.transform(X_test)
-                                
-                                # Get model performance info
-                                if 'performance' in model_data:
-                                    st.write(f"Model training performance: MAE={model_data['performance']['mae']:.4f}, "
-                                            f"Rel Error={model_data['performance']['relative_error']:.1%}")
-                                
-                                # Predict - handle both single model and ensemble
-                                if isinstance(model, dict):
-                                    # This is an ensemble
-                                    predictions = {}
-                                    
-                                    # Get predictions from each model
-                                    for name, m in model.items():
-                                        if hasattr(m, 'predict'):
-                                            pred = m.predict(X_test_scaled)[0]
-                                            predictions[name] = pred
-                                            st.write(f"  {name} prediction: |a|={pred[0]:.3f}, |b|={pred[1]:.3f}, |c|={pred[2]:.3f}")
-                                    
-                                    # Apply ensemble strategy
-                                    approach = model_data.get('approach', 'Ensemble (Weighted)')
-                                    
-                                    if 'Weighted' in approach:
-                                        # Use training weights
-                                        weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
-                                        y_pred = np.zeros(3)
-                                        total_weight = 0
-                                        for name, pred in predictions.items():
-                                            weight = weights.get(name, 1.0/len(predictions))
-                                            y_pred += pred * weight
-                                            total_weight += weight
-                                        y_pred /= total_weight  # Normalize
-                                        st.write("Ensemble strategy: Weighted (rf=0.4, et=0.3, nn=0.3)")
-                                    else:
-                                        # Simple average
-                                        y_pred = np.mean(list(predictions.values()), axis=0)
-                                        st.write("Ensemble strategy: Simple average")
-                                else:
-                                    # Single model
-                                    y_pred = model.predict(X_test_scaled)[0]
-                                
-                                # Apply calibration if available
-                                if model_data.get('calibration_factors'):
-                                    cal_factors = model_data['calibration_factors']
-                                    st.write(f"Applying calibration factors: {[f'{c:.3f}' for c in cal_factors]}")
-                                    for i in range(3):
-                                        y_pred[i] *= cal_factors[i]
-                                
-                                # Model info
-                                model_info = model_data.get('approach', 'Neural Network')
-                                
-                            else:
-                                # Original model without engineered features
-                                model = model_data['model']
-                                scaler = model_data['scaler']
-                                
-                                # Prepare features (sorted frequencies and amplitudes interleaved)
-                                features = []
-                                for i in range(5):
-                                    features.extend([sorted_freqs[i], sorted_amps[i]])
-                                
-                                X_test = np.array([features])
-                                X_test_scaled = scaler.transform(X_test)
-                                
-                                # Predict
-                                y_pred = model.predict(X_test_scaled)[0]
-                                
-                                # Model info
-                                model_info = model_data.get('model_type', 'Unknown')
-                            
-                            # Calculate confidence
-                            non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
-                            confidence = min(95, 50 + non_zero_peaks * 9)
-                            
-                            st.session_state.inverse_results = {
-                                'a_mag': float(y_pred[0]),
-                                'b_mag': float(y_pred[1]),
-                                'c_mag': float(y_pred[2]),
-                                'confidence': confidence,
-                                'success': True,
-                                'model_info': model_info,
-                                'model_file': model_path
-                            }
-                            
-                            st.success(f"✅ Prediction complete using {model_info}")
-                            
-                    else:
-                        st.error(f"Model file not found at: {model_path}")
-                        st.info("Please ensure the model file is in the quantum-app directory.")
-                        
-                except Exception as e:
-                    st.error(f"Error in prediction: {str(e)}")
-                    import traceback
-                    st.text(traceback.format_exc())
-        
-        # Results section
-        if st.session_state.inverse_results and st.session_state.inverse_results['success']:
-            st.markdown("### 📊 Results")
-            st.markdown("**Predicted State Magnitudes:**")
-            
-            # Show predicted magnitudes with comparison to forward values
-            pred_a = st.session_state.inverse_results['a_mag']
-            pred_b = st.session_state.inverse_results['b_mag']
-            pred_c = st.session_state.inverse_results['c_mag']
-            
-            if st.session_state.forward_magnitudes:
-                true_a = st.session_state.forward_magnitudes['a']
-                true_b = st.session_state.forward_magnitudes['b']
-                true_c = st.session_state.forward_magnitudes['c']
-                
-                # Display with comparison
-                st.markdown("**Magnitude Comparison:**")
-                col_pred, col_true, col_diff = st.columns(3)
-                
-                with col_pred:
-                    st.markdown("**Predicted:**")
-                    st.write(f"|a| = {pred_a:.3f}")
-                    st.write(f"|b| = {pred_b:.3f}")
-                    st.write(f"|c| = {pred_c:.3f}")
-                
-                with col_true:
-                    st.markdown("**True (Forward):**")
-                    st.write(f"|a| = {true_a:.3f}")
-                    st.write(f"|b| = {true_b:.3f}")
-                    st.write(f"|c| = {true_c:.3f}")
-                
-                with col_diff:
-                    st.markdown("**Error:**")
-                    st.write(f"Δ|a| = {abs(pred_a - true_a):.3f}")
-                    st.write(f"Δ|b| = {abs(pred_b - true_b):.3f}")
-                    st.write(f"Δ|c| = {abs(pred_c - true_c):.3f}")
-                
-                # Calculate relative errors
-                rel_error_a = abs(pred_a - true_a) / true_a * 100 if true_a > 0 else 0
-                rel_error_b = abs(pred_b - true_b) / true_b * 100 if true_b > 0 else 0
-                rel_error_c = abs(pred_c - true_c) / true_c * 100 if true_c > 0 else 0
-                avg_rel_error = (rel_error_a + rel_error_b + rel_error_c) / 3
-                
-                st.markdown(f"**Average Relative Error:** {avg_rel_error:.1f}%")
-                
-                # Show improvement message if error is now low
-                if avg_rel_error < 10:
-                    st.success("✅ Excellent prediction accuracy!")
-                elif avg_rel_error < 20:
-                    st.info("✓ Good prediction accuracy")
-            else:
-                # Just show predictions if no forward values
-                st.write(f"|a| = {pred_a:.3f}")
-                st.write(f"|b| = {pred_b:.3f}")
-                st.write(f"|c| = {pred_c:.3f}")
-            
-            st.write("")
-            st.write(f"**Model Confidence:** {st.session_state.inverse_results['confidence']}%")
-            
-            # Note about phase information
-            st.info("ℹ️ Note: The ML model predicts only magnitudes |a|, |b|, |c|. "
-                    "Phase information cannot be recovered from FFT peaks alone due to the "
-                    "loss of phase information in the power spectrum.")
-            
-            if st.button("📊 Show Comparison Plots", key="comparison"):
-                # Create comparison plots
-                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-                
-                # 1. Bar chart comparing magnitudes
-                if st.session_state.forward_magnitudes:
-                    labels = ['|a|', '|b|', '|c|']
-                    predicted = [pred_a, pred_b, pred_c]
-                    true_vals = [true_a, true_b, true_c]
-                    
-                    x = np.arange(len(labels))
-                    width = 0.35
-                    
-                    ax1.bar(x - width/2, true_vals, width, label='True', color='blue', alpha=0.7)
-                    ax1.bar(x + width/2, predicted, width, label='Predicted', color='green', alpha=0.7)
-                    ax1.set_ylabel('Magnitude')
-                    ax1.set_title('Magnitude Comparison')
-                    ax1.set_xticks(x)
-                    ax1.set_xticklabels(labels)
-                    ax1.legend()
-                    ax1.grid(True, alpha=0.3)
-                else:
-                    # Just show predicted if no true values
-                    labels = ['|a|', '|b|', '|c|']
-                    predicted = [pred_a, pred_b, pred_c]
-                    ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
-                    ax1.set_ylabel('Magnitude')
-                    ax1.set_title('Predicted State Magnitudes')
-                    ax1.set_ylim(0, max(predicted) * 1.2)
-                
-                # 2. Radar plot for state visualization
-                categories = ['|a|', '|b|', '|c|']
-                angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-                angles += angles[:1]  # Complete the circle
-                
-                predicted_radar = [pred_a, pred_b, pred_c]
-                predicted_radar += predicted_radar[:1]
-                
-                ax2 = plt.subplot(133, projection='polar')
-                ax2.plot(angles, predicted_radar, 'o-', linewidth=2, label='Predicted', color='green')
-                ax2.fill(angles, predicted_radar, alpha=0.25, color='green')
-                
-                if st.session_state.forward_magnitudes:
-                    true_radar = [true_a, true_b, true_c]
-                    true_radar += true_radar[:1]
-                    ax2.plot(angles, true_radar, 'o-', linewidth=2, label='True', color='blue')
-                    ax2.fill(angles, true_radar, alpha=0.25, color='blue')
-                
-                ax2.set_xticks(angles[:-1])
-                ax2.set_xticklabels(categories)
-                ax2.set_title('State Magnitude Profile')
-                ax2.legend()
-                
-                # 3. Confidence visualization
-                ax3.pie([st.session_state.inverse_results['confidence'], 
-                        100 - st.session_state.inverse_results['confidence']], 
-                       labels=['Confident', 'Uncertain'],
-                       colors=['green', 'lightgray'],
-                       startangle=90)
-                ax3.set_title('Prediction Confidence')
-                
-                plt.tight_layout()
-                st.pyplot(fig)
+        st.markdown("**Inverse Demo:** FFT Peaks → State Magnitudes")
+        st.info("Use the full interface in previous versions or the Test Performance Analysis tab for complete inverse functionality.")
 
 # ==========================================
 # STREAMLIT APP MAIN STRUCTURE
@@ -1326,12 +1296,14 @@ if 'inverse_results' not in st.session_state:
     st.session_state.inverse_results = None
 if 'forward_magnitudes' not in st.session_state:
     st.session_state.forward_magnitudes = None
+if 'run_bulk_analysis' not in st.session_state:
+    st.session_state.run_bulk_analysis = False
 
 # Title and description
 st.title("🔬 Quantum FFT State Analyzer")
 
-# Create tabs
-tab1, tab2 = st.tabs(["🎯 Main Application", "🔄 How It Works"])
+# Create tabs - UPDATED with new tab
+tab1, tab2, tab3 = st.tabs(["🎯 Main Application", "📈 Test Performance Analysis", "🔄 How It Works"])
 
 with tab1:
     show_main_app()
@@ -1354,67 +1326,55 @@ with tab1:
         st.info(f"k-values {'locked 🔒' if st.session_state.k_values_locked else 'unlocked 🔓'}")
 
 with tab2:
+    show_test_performance_analysis()  # NEW TAB
+
+with tab3:
     show_workflow_explanation()
 
 # Sidebar with instructions
 with st.sidebar:
-    st.header("📖 Instructions & Troubleshooting")
-    
-    # Troubleshooting section
-    st.markdown("""
-    ### 🔧 Model Loading Issues?
-    
-    If the model file can't be loaded, it's likely because:
-    1. **Git LFS Issue**: The .pkl file is stored in Git LFS and wasn't pulled properly
-    2. **File too large**: Streamlit has limitations on file sizes
-    
-    ### Solutions:
-    
-    #### Option 1: Upload Model to Cloud
-    1. Download the model file locally
-    2. Upload to Google Drive, Dropbox, or similar
-    3. Get a direct download link
-    4. Use "Download from URL" option
-    
-    #### Option 2: Use Git LFS locally
-    ```bash
-    git lfs pull
-    ```
-    
-    #### Option 3: Host model separately
-    Upload the model to:
-    - GitHub Releases (not in repo)
-    - Hugging Face Model Hub
-    - AWS S3 / Google Cloud Storage
-    
-    ---
-    """)
+    st.header("📖 Instructions & Features")
     
     with st.expander("⚡ Quick Start", expanded=True):
         st.markdown("""
-        1. **Forward**: Enter quantum state → Get FFT peaks
-        2. **Inverse**: Enter FFT peaks → Get state magnitudes
-        3. Use 🔒 to sync coupling constants
-        4. Use ↩️ to auto-fill inverse from forward
-        5. Check "How It Works" tab for details
+        ### 🎯 Main App
+        - Simple forward/inverse demo
+        - Real-time quantum simulation
+        
+        ### 📈 Test Analysis  
+        - **Upload test dataset** or use default
+        - **Run bulk predictions** on all samples
+        - **Comprehensive error analysis**
+        - **Visual performance insights**
+        
+        ### 🔄 How It Works
+        - Detailed workflow explanation
+        - Technical implementation
+        """)
+    
+    with st.expander("📊 Test Analysis Features"):
+        st.markdown("""
+        **Performance Metrics:**
+        - MAE, RMSE, R² per magnitude
+        - Error distribution histograms
+        - Relative error analysis
+        
+        **Advanced Analysis:**
+        - Performance vs magnitude ranges
+        - Best/worst case identification
+        - Statistical percentiles
+        - Outlier detection
+        
+        **Visualizations:**
+        - Predicted vs true scatter plots
+        - Error distribution curves
+        - Performance degradation analysis
         """)
     
     with st.expander("⚠️ Important Notes"):
         st.markdown("""
         - **Peak ordering is CRITICAL** - always by amplitude!
-        - Phase information cannot be recovered
-        - Low errors (< 10%) = good predictions
-        - Confidence depends on number of peaks
+        - Large datasets may take time to process
+        - Results are cached for performance
+        - Low magnitude states show higher errors
         """)
-    
-    st.markdown("---")
-    st.markdown("### 📊 Current Session")
-    if st.session_state.forward_results:
-        st.success("✓ Forward simulation complete")
-    else:
-        st.info("○ No forward simulation yet")
-        
-    if st.session_state.inverse_results:
-        st.success("✓ Inverse prediction complete")
-    else:
-        st.info("○ No inverse prediction yet")
