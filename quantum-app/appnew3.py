@@ -17,8 +17,6 @@ from scipy.interpolate import CubicSpline
 from scipy.optimize import minimize_scalar
 import requests
 import tempfile
-from tqdm import tqdm
-import seaborn as sns
 
 # Page configuration
 st.set_page_config(
