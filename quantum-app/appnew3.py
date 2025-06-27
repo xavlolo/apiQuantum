@@ -1,0 +1,2233 @@
+"""
+Quantum FFT State Analyzer - Enhanced Version with Star Sensor
+A web interface for quantum state analysis including:
+- Original 6-qubit chain forward/inverse problem
+- Test performance analysis
+- 6-Qubit Star "Quantum Sensor" model
+- Workflow explanation
+"""
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import joblib
+import os
+from itertools import product
+from scipy.signal import find_peaks, peak_widths
+from scipy.interpolate import CubicSpline
+from scipy.optimize import minimize_scalar
+import requests
+import tempfile
+
+# Page configuration
+st.set_page_config(
+    page_title="Quantum FFT State Analyzer",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# ==========================================
+# MODEL DOWNLOAD FUNCTION
+# ==========================================
+
+@st.cache_resource
+def load_model_from_url(url):
+    """Download and cache model from URL"""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
+            tmp_file.write(response.content)
+            tmp_path = tmp_file.name
+        
+        # Load model
+        model_data = joblib.load(tmp_path)
+        
+        # Clean up
+        os.unlink(tmp_path)
+        
+        return model_data
+    except Exception as e:
+        st.error(f"Failed to download model: {str(e)}")
+        return None
+
+def check_model_file(filename):
+    """Check if a file is a valid model file or just an LFS pointer"""
+    if not os.path.exists(filename):
+        return False, "File does not exist"
+    
+    # Check file size - LFS pointer files are typically < 1KB
+    file_size = os.path.getsize(filename)
+    if file_size < 1000:  # Less than 1KB, likely an LFS pointer
+        return False, f"File too small ({file_size} bytes) - likely Git LFS pointer"
+    
+    # Try to read the file
+    try:
+        with open(filename, 'rb') as f:
+            header = f.read(100)
+            # Check if it's an LFS pointer
+            if b'version https://git-lfs.github.com' in header:
+                return False, "File is a Git LFS pointer, not actual model data"
+    except:
+        pass
+    
+    return True, "File appears valid"
+
+# Custom CSS for better styling
+st.markdown("""
+    <style>
+    .main {
+        padding: 0rem 1rem;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #4CAF50;
+        color: white;
+        font-weight: bold;
+    }
+    .results-box {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        margin-top: 20px;
+    }
+    .magnitude-display {
+        background-color: #e3f2fd;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 5px 0;
+        font-weight: bold;
+    }
+    .phase-display {
+        background-color: #fff3e0;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 5px 0;
+    }
+    .workflow-box {
+        background-color: #f8f9fa;
+        padding: 20px;
+        border-radius: 10px;
+        border: 2px solid #dee2e6;
+        margin: 10px 0;
+    }
+    .workflow-step {
+        background-color: #e3f2fd;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+        border-left: 4px solid #2196F3;
+    }
+    .ml-feature {
+        background-color: #fff3e0;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 5px 0;
+    }
+    .metric-box {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #dee2e6;
+        text-align: center;
+        margin: 5px 0;
+    }
+    .metric-value {
+        font-size: 24px;
+        font-weight: bold;
+        color: #2196F3;
+    }
+    .metric-label {
+        font-size: 12px;
+        color: #666;
+        margin-top: 5px;
+    }
+    .error-bad {
+        background-color: #ffebee;
+        border-left: 4px solid #f44336;
+        padding: 10px;
+        margin: 5px 0;
+    }
+    .error-good {
+        background-color: #e8f5e8;
+        border-left: 4px solid #4caf50;
+        padding: 10px;
+        margin: 5px 0;
+    }
+    .sensor-info {
+        background-color: #e8f5e9;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #4caf50;
+        margin: 10px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ==========================================
+# QUANTUM SIMULATION FUNCTIONS (Original from appnew3)
+# ==========================================
+
+@st.cache_data
+def get_full_basis_6qubits():
+    basis_states = list(product([0, 1], repeat=6))
+    state_to_idx = {s: i for i, s in enumerate(basis_states)}
+    return basis_states, state_to_idx
+
+def commutator(H, rho):
+    return -1j * (H @ rho - rho @ H)
+
+def rk4_step(H, rho, dt):
+    k1 = dt * commutator(H, rho)
+    k2 = dt * commutator(H, rho + 0.5 * k1)
+    k3 = dt * commutator(H, rho + 0.5 * k2)
+    k4 = dt * commutator(H, rho + k3)
+    return rho + (k1 + 2*k2 + 2*k3 + k4) / 6
+
+def initialize_superposition(basis_states, state_to_idx, superposition_dict):
+    psi = np.zeros(len(basis_states), complex)
+    for state, amp in superposition_dict.items():
+        if state in state_to_idx:
+            psi[state_to_idx[state]] = amp
+    psi /= np.linalg.norm(psi)
+    rho = np.outer(psi, psi.conj())
+    return psi, rho
+
+def calculate_zz_energy(state, k_pattern):
+    energy = 0.0
+    for (i, j), k_val in k_pattern.items():
+        energy += k_val if state[i] == state[j] else -k_val
+    return energy
+
+@st.cache_data
+def generate_hamiltonian_fullbasis(basis_states, state_to_idx, k_pattern, j_pairs, J_coupling=1.0):
+    n = len(basis_states)
+    H = np.zeros((n, n), complex)
+    
+    # Diagonal elements (ZZ interactions)
+    for idx, st in enumerate(basis_states):
+        H[idx, idx] = calculate_zz_energy(st, k_pattern)
+
+    # Off-diagonal elements (XX+YY interactions)
+    for (i, j) in j_pairs:
+        for idx, st in enumerate(basis_states):
+            if st[i] != st[j]:
+                flipped = list(st)
+                flipped[i], flipped[j] = st[j], st[i]
+                idx2 = state_to_idx[tuple(flipped)]
+                H[idx, idx2] += J_coupling
+                H[idx2, idx] += J_coupling
+
+    evals, evecs = np.linalg.eigh(H)
+    return H, evals, evecs
+
+# ==========================================
+# GENERALIZED SIMULATION FUNCTIONS (For Star Sensor)
+# ==========================================
+
+@st.cache_data
+def get_full_basis(n_qubits):
+    """Generates the computational basis for a given number of qubits."""
+    basis_states = list(product([0, 1], repeat=n_qubits))
+    state_to_idx = {s: i for i, s in enumerate(basis_states)}
+    return basis_states, state_to_idx
+
+@st.cache_data
+def generate_hamiltonian_general(_basis_states, _state_to_idx, j_couplings, k_couplings):
+    """
+    Generates a Hamiltonian for a given set of J (XX+YY) and k (ZZ) couplings.
+    """
+    n = len(_basis_states)
+    H = np.zeros((n, n), dtype=complex)
+
+    for (i, j), k_val in k_couplings.items():
+        for idx, state in enumerate(_basis_states):
+            s_i = 1 if state[i] == 0 else -1
+            s_j = 1 if state[j] == 0 else -1
+            H[idx, idx] += k_val * s_i * s_j
+
+    for (i, j), j_val in j_couplings.items():
+        for idx, state in enumerate(_basis_states):
+            if state[i] != state[j]:
+                flipped_state = list(state)
+                flipped_state[i], flipped_state[j] = state[j], state[i]
+                idx2 = _state_to_idx[tuple(flipped_state)]
+                H[idx, idx2] += 2 * j_val
+    return H
+
+@st.cache_data
+def run_generalized_simulation(n_qubits, initial_psi, hamiltonian, monitored_qubit, t_max=50, dt=0.01):
+    """Runs a forward simulation for a generic system."""
+    basis_states, _ = get_full_basis(n_qubits)
+    rho0 = np.outer(initial_psi, initial_psi.conj())
+    projector = np.diag([s[monitored_qubit] for s in basis_states])
+
+    times = np.arange(0, t_max + dt, dt)
+    probs = np.zeros(len(times))
+    probs[0] = np.real(np.trace(rho0 @ projector))
+
+    rho = rho0.copy()
+    for i in range(1, len(times)):
+        rho = rk4_step(hamiltonian, rho, dt)
+        probs[i] = np.real(np.trace(rho @ projector))
+
+    if np.std(probs) < 1e-6:
+        return times, probs, (np.array([0]), np.array([0]))
+
+    sig = probs - np.mean(probs)
+    win = np.hanning(len(sig))
+    fft = np.fft.fft(sig * win)
+    freq = np.fft.fftfreq(len(fft), dt)
+
+    mask = freq >= 0
+    return times, probs, (freq[mask], np.abs(fft[mask]))
+
+def analyze_fft_with_peak_fitting(probs, tpoints, qubit_idx, 
+                                 min_peak_height=0.1,
+                                 peak_type='lorentzian',
+                                 fit_window_factor=5,
+                                 plot_results=False):
+    """Simplified FFT analysis using ONLY CubicSpline - matches training code"""
+    
+    if np.std(probs[:, qubit_idx]) < 0.001:
+        empty_freq = np.linspace(0, 1, 100)
+        empty_mag = np.zeros_like(empty_freq)
+        return {
+            'raw_fft': (empty_freq, empty_mag),
+            'peaks': [],
+            'fitted_spectrum': empty_mag,
+            'message': 'No oscillation detected'
+        }
+    
+    dt = tpoints[1] - tpoints[0]
+    sig = probs[:, qubit_idx] - np.mean(probs[:, qubit_idx])
+    win = np.hanning(len(sig))
+    fft = np.fft.fft(sig * win)
+    freq = np.fft.fftfreq(len(fft), dt)
+    
+    mask = freq >= 0
+    pos_freq = freq[mask]
+    pos_mag = np.abs(fft[mask])
+    
+    threshold = min_peak_height * np.max(pos_mag)
+    peaks, _ = find_peaks(pos_mag, height=threshold, distance=1)
+    
+    if len(peaks) > 0 and pos_freq[peaks[0]] < 0.01:
+        peaks = peaks[1:]
+    
+    if len(peaks) == 0:
+        return {
+            'raw_fft': (pos_freq, pos_mag),
+            'peaks': [],
+            'fitted_spectrum': np.zeros_like(pos_mag)
+        }
+    
+    spline = CubicSpline(pos_freq, pos_mag)
+    fitted_spectrum = spline(pos_freq)
+    
+    fitted_peaks = []
+    
+    for peak_idx in peaks:
+        window = 20
+        left_idx = max(0, peak_idx - window)
+        right_idx = min(len(pos_freq), peak_idx + window)
+        freq_window = pos_freq[left_idx:right_idx]
+        
+        if len(freq_window) < 4:
+            continue
+            
+        freq_range = (freq_window[0], freq_window[-1])
+        result = minimize_scalar(lambda x: -spline(x), bounds=freq_range, method='bounded')
+        
+        precise_freq = result.x
+        precise_amp = spline(precise_freq)
+        
+        half_max = precise_amp / 2
+        
+        left_half = precise_freq
+        for f in np.linspace(freq_window[0], precise_freq, 100):
+            if spline(f) >= half_max:
+                left_half = f
+                break
+        
+        right_half = precise_freq
+        for f in np.linspace(precise_freq, freq_window[-1], 100):
+            if spline(f) < half_max:
+                right_half = f
+                break
+        
+        width = right_half - left_half
+        Q_factor = precise_freq / (2 * width) if width > 0 else np.inf
+        
+        integrated_intensity = precise_amp * width
+        
+        fitted_peaks.append({
+            'frequency': precise_freq,
+            'amplitude': precise_amp,
+            'width': width,
+            'integrated_intensity': integrated_intensity,
+            'Q_factor': Q_factor,
+            'raw_peak_idx': peak_idx,
+            'fit_success': True
+        })
+    
+    fitted_peaks.sort(key=lambda x: x['amplitude'], reverse=True)
+    
+    while len(fitted_peaks) < 5:
+        fitted_peaks.append({
+            'frequency': 0.0,
+            'amplitude': 0.0,
+            'width': 0.0,
+            'integrated_intensity': 0.0,
+            'Q_factor': 0.0,
+            'raw_peak_idx': -1,
+            'fit_success': False
+        })
+    
+    if len(fitted_peaks) > 5:
+        fitted_peaks = fitted_peaks[:5]
+    
+    return {
+        'raw_fft': (pos_freq, pos_mag),
+        'peaks': fitted_peaks,
+        'fitted_spectrum': fitted_spectrum
+    }
+
+def run_quantum_simulation(a_complex, b_complex, c_complex, k01, k23, k45, j_coupling):
+    """Run the quantum simulation and return FFT peaks"""
+    
+    dt = 0.01
+    t_max = 50
+    
+    k_pattern = {
+        (0,1): k01,
+        (2,3): k23,
+        (4,5): k45
+    }
+    j_pairs = [(0,2), (2,4)]
+    
+    basis_states, state_to_idx = get_full_basis_6qubits()
+    projectors = [np.diag([s[q] for s in basis_states]) for q in range(6)]
+    
+    state_A = (1,1,0,0,0,0)
+    state_B = (1,0,0,1,0,0)
+    state_C = (1,0,0,0,0,1)
+    
+    superposition_dict = {
+        state_A: a_complex,
+        state_B: b_complex,
+        state_C: c_complex
+    }
+    
+    psi0, rho0 = initialize_superposition(basis_states, state_to_idx, superposition_dict)
+    
+    H, evals, evecs = generate_hamiltonian_fullbasis(
+        basis_states, state_to_idx, k_pattern, j_pairs, j_coupling
+    )
+    
+    times = np.arange(0, t_max + dt, dt)
+    probs = np.zeros((len(times), 6))
+    
+    for q in range(6):
+        probs[0, q] = np.real(np.trace(rho0 @ projectors[q]))
+    
+    rho = rho0.copy()
+    for i in range(1, len(times)):
+        rho = rk4_step(H, rho, dt)
+        for q in range(6):
+            probs[i, q] = np.real(np.trace(rho @ projectors[q]))
+    
+    peak_data = analyze_fft_with_peak_fitting(probs, times, 4, min_peak_height=0.05)
+    
+    peaks_list = peak_data['peaks']
+    peaks_sorted = sorted(peaks_list, key=lambda x: x['amplitude'], reverse=True)
+    
+    peaks = []
+    for peak in peaks_sorted[:5]:
+        peaks.append({
+            'freq': float(peak['frequency']),
+            'amp': float(peak['amplitude'])
+        })
+    
+    while len(peaks) < 5:
+        peaks.append({'freq': 0.0, 'amp': 0.0})
+    
+    freq, mag = peak_data['raw_fft']
+    
+    return peaks[:5], probs, times, (freq, mag)
+
+def draw_network_diagram():
+    """Draw the 6-qubit chain topology in a 2x3 grid layout"""
+    fig = go.Figure()
+    
+    qubit_x = [0, 2, 4, 0, 2, 4]
+    qubit_y = [1, 1, 1, 0, 0, 0]
+    qubit_labels = ['0', '2', '4', '1', '3', '5']
+    
+    qubit_colors = ['lightblue', 'lightblue', 'lightblue', 'lightpink', 'lightpink', 'lightpink']
+    
+    fig.add_trace(go.Scatter(
+        x=qubit_x, y=qubit_y,
+        mode='markers+text',
+        marker=dict(size=60, color=qubit_colors, line=dict(width=2, color='darkgray')),
+        text=qubit_labels,
+        textposition="middle center",
+        textfont=dict(size=16, color='black'),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    j_connections = [(0, 1), (1, 2)]
+    for i, (start, end) in enumerate(j_connections):
+        fig.add_trace(go.Scatter(
+            x=[qubit_x[start], qubit_x[end]], 
+            y=[qubit_y[start], qubit_y[end]],
+            mode='lines',
+            line=dict(width=2, color='darkgreen'),
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+        mid_x = (qubit_x[start] + qubit_x[end]) / 2
+        fig.add_annotation(
+            x=mid_x, y=1.2, 
+            text=f"J<sub>{qubit_labels[start]},{qubit_labels[end]}</sub>", 
+            showarrow=False, 
+            font=dict(size=12, color='darkgreen')
+        )
+    
+    k_pairs = [(0, 3), (1, 4), (2, 5)]
+    k_labels = ['K<sub>0,1</sub>', 'K<sub>2,3</sub>', 'K<sub>4,5</sub>']
+    for i, (top, bottom) in enumerate(k_pairs):
+        fig.add_trace(go.Scatter(
+            x=[qubit_x[top], qubit_x[bottom]], 
+            y=[qubit_y[top], qubit_y[bottom]],
+            mode='lines',
+            line=dict(width=4, color='red'),
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+        fig.add_annotation(
+            x=qubit_x[top] - 0.3, 
+            y=(qubit_y[top] + qubit_y[bottom]) / 2,
+            text=k_labels[i], 
+            showarrow=False, 
+            font=dict(size=12, color='red')
+        )
+    
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(width=4, color='red'),
+        name='k-coupling (ZZ)'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(width=2, color='darkgreen'),
+        name='J-coupling (XX+YY)'
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text="6-Qubit Network Topology",
+            x=0.5,
+            xanchor='center'
+        ),
+        showlegend=True,
+        legend=dict(
+            x=1.02,
+            y=0.5,
+            xanchor='left',
+            yanchor='middle'
+        ),
+        xaxis=dict(
+            showgrid=False, 
+            zeroline=False, 
+            showticklabels=False, 
+            range=[-1, 5]
+        ),
+        yaxis=dict(
+            showgrid=False, 
+            zeroline=False, 
+            showticklabels=False, 
+            range=[-0.5, 1.5]
+        ),
+        height=300,
+        margin=dict(l=50, r=150, t=50, b=50),
+        plot_bgcolor='white'
+    )
+    
+    return fig
+
+def draw_star_topology(n_qubits, j_couplings, k_couplings):
+    """Draws the star topology for the quantum sensor."""
+    fig = go.Figure()
+    
+    # Define positions for star topology
+    pos = {0: [0, 0]}  # Center (probe qubit)
+    for i in range(1, n_qubits):
+        angle = 2 * np.pi * (i-1) / (n_qubits-1)
+        pos[i] = [np.cos(angle), np.sin(angle)]
+    
+    # Draw J-couplings (green, solid)
+    for (q1, q2) in j_couplings.keys():
+        fig.add_trace(go.Scatter(
+            x=[pos[q1][0], pos[q2][0]], 
+            y=[pos[q1][1], pos[q2][1]], 
+            mode='lines', 
+            line=dict(color='green', width=3), 
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+    
+    # Draw k-couplings (red, dashed)
+    for (q1, q2) in k_couplings.keys():
+        fig.add_trace(go.Scatter(
+            x=[pos[q1][0], pos[q2][0]], 
+            y=[pos[q1][1], pos[q2][1]], 
+            mode='lines', 
+            line=dict(color='red', width=2, dash='dash'), 
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+    
+    # Draw qubits
+    colors = ['yellow' if i == 0 else 'lightblue' for i in range(n_qubits)]
+    labels = ['Probe' if i == 0 else f'M{i}' for i in range(n_qubits)]
+    
+    fig.add_trace(go.Scatter(
+        x=[p[0] for p in pos.values()], 
+        y=[p[1] for p in pos.values()], 
+        text=labels, 
+        mode='markers+text', 
+        marker=dict(size=50, color=colors, line=dict(width=2, color='darkgray')), 
+        textfont=dict(size=14), 
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    # Add legend
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(width=3, color='green'),
+        name='J-coupling (XX+YY)'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='lines',
+        line=dict(width=2, color='red', dash='dash'),
+        name='k-coupling (ZZ)'
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text="6-Qubit Star Topology (Quantum Sensor)",
+            x=0.5,
+            xanchor='center'
+        ),
+        xaxis=dict(visible=False, range=[-1.5, 1.5]), 
+        yaxis=dict(visible=False, range=[-1.5, 1.5]), 
+        plot_bgcolor='white', 
+        height=400,
+        margin=dict(t=50, b=0, l=0, r=0),
+        showlegend=True,
+        legend=dict(x=0.02, y=0.98)
+    )
+    return fig
+
+# ==========================================
+# TEST PERFORMANCE ANALYSIS FUNCTIONS
+# ==========================================
+
+@st.cache_data
+def load_test_dataset(file_path=None):
+    """Load test dataset from file or default location"""
+    if file_path is None:
+        # Try default locations
+        default_files = [
+            "quantum_fft_test_20250607_195702.csv",
+            "ml_data_cubic_spline/quantum_fft_test_20250616_214918.csv",
+            "quantum_fft_test.csv"
+        ]
+        
+        for file in default_files:
+            if os.path.exists(file):
+                file_path = file
+                break
+        
+        if file_path is None:
+            return None, "No test dataset found. Please upload one."
+    
+    try:
+        df = pd.read_csv(file_path)
+        return df, f"Loaded {len(df)} samples from {file_path}"
+    except Exception as e:
+        return None, f"Error loading dataset: {str(e)}"
+
+def prepare_features_for_prediction(df):
+    """Prepare features exactly as in training"""
+    # Sort peaks by amplitude for each sample
+    sorted_data = []
+    
+    for _, row in df.iterrows():
+        # Get peak data
+        peaks = []
+        for i in range(1, 6):
+            freq = row[f'peak{i}_freq']
+            amp = row[f'peak{i}_amp']
+            peaks.append((freq, amp))
+        
+        # Sort by amplitude (descending)
+        peaks_sorted = sorted(peaks, key=lambda x: x[1], reverse=True)
+        
+        # Extract sorted frequencies and amplitudes
+        sorted_freqs = [p[0] for p in peaks_sorted]
+        sorted_amps = [p[1] for p in peaks_sorted]
+        
+        # Basic features (10)
+        features = []
+        for i in range(5):
+            features.extend([sorted_freqs[i], sorted_amps[i]])
+        
+        # Engineered features (5)
+        total_power = sum(sorted_amps)
+        n_peaks = sum(1 for f in sorted_freqs if f > 0)
+        max_freq = max(sorted_freqs)
+        max_amp = max(sorted_amps)
+        freq_spread = max(sorted_freqs) - min(sorted_freqs)
+        
+        features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
+        
+        sorted_data.append(features)
+    
+    return np.array(sorted_data)
+
+def calculate_true_magnitudes(df):
+    """Calculate true magnitudes from complex amplitudes"""
+    a_mag = np.sqrt(df['a_real']**2 + df['a_imag']**2)
+    b_mag = np.sqrt(df['b_real']**2 + df['b_imag']**2)
+    c_mag = np.sqrt(df['c_real']**2 + df['c_imag']**2)
+    
+    return np.column_stack([a_mag, b_mag, c_mag])
+
+@st.cache_data
+def run_bulk_predictions(test_df, model_path):
+    """Run predictions on entire test dataset"""
+    try:
+        # Load model
+        model_data = joblib.load(model_path)
+        model = model_data['model']
+        scaler = model_data['scaler']
+        
+        # Prepare features
+        X_test = prepare_features_for_prediction(test_df)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Get true magnitudes
+        y_true = calculate_true_magnitudes(test_df)
+        
+        # Make predictions
+        if isinstance(model, dict):
+            # Ensemble model
+            predictions = {}
+            for name, m in model.items():
+                if hasattr(m, 'predict'):
+                    predictions[name] = m.predict(X_test_scaled)
+            
+            # Weighted ensemble
+            approach = model_data.get('approach', 'Ensemble (Weighted)')
+            if 'Weighted' in approach:
+                weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
+                y_pred = np.zeros_like(list(predictions.values())[0])
+                total_weight = 0
+                for name, pred in predictions.items():
+                    weight = weights.get(name, 1.0/len(predictions))
+                    y_pred += pred * weight
+                    total_weight += weight
+                y_pred /= total_weight
+            else:
+                # Simple average
+                y_pred = np.mean(list(predictions.values()), axis=0)
+        else:
+            # Single model
+            y_pred = model.predict(X_test_scaled)
+        
+        # Apply calibration if available
+        if model_data.get('calibration_factors'):
+            cal_factors = model_data['calibration_factors']
+            for i in range(3):
+                y_pred[:, i] *= cal_factors[i]
+        
+        return y_true, y_pred, model_data
+        
+    except Exception as e:
+        st.error(f"Error in bulk prediction: {str(e)}")
+        return None, None, None
+
+def analyze_errors(y_true, y_pred):
+    """Comprehensive error analysis"""
+    # Calculate various error metrics
+    mae_per_sample = np.mean(np.abs(y_true - y_pred), axis=1)
+    rmse_per_sample = np.sqrt(np.mean((y_true - y_pred)**2, axis=1))
+    
+    # Relative errors (avoid division by zero)
+    rel_errors = np.abs(y_true - y_pred) / (y_true + 1e-10) * 100
+    rel_error_per_sample = np.mean(rel_errors, axis=1)
+    
+    # Per-magnitude errors
+    mae_per_mag = np.mean(np.abs(y_true - y_pred), axis=0)
+    rmse_per_mag = np.sqrt(np.mean((y_true - y_pred)**2, axis=0))
+    
+    # R² for each magnitude
+    r2_per_mag = []
+    for i in range(3):
+        ss_res = np.sum((y_true[:, i] - y_pred[:, i])**2)
+        ss_tot = np.sum((y_true[:, i] - np.mean(y_true[:, i]))**2)
+        r2_per_mag.append(1 - (ss_res / ss_tot))
+    
+    # Average magnitudes per sample
+    avg_true_mag = np.mean(y_true, axis=1)
+    
+    return {
+        'mae_per_sample': mae_per_sample,
+        'rmse_per_sample': rmse_per_sample,
+        'rel_error_per_sample': rel_error_per_sample,
+        'mae_per_mag': mae_per_mag,
+        'rmse_per_mag': rmse_per_mag,
+        'r2_per_mag': r2_per_mag,
+        'avg_true_mag': avg_true_mag,
+        'rel_errors': rel_errors
+    }
+
+def show_test_performance_analysis():
+    """Display the test performance analysis tab"""
+    
+    st.header("📈 Test Performance Analysis")
+    st.markdown("### Comprehensive ML Model Evaluation on Test Dataset")
+    
+    # Dataset loading section
+    st.markdown("---")
+    st.subheader("📁 Dataset Loading")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # File upload option
+        uploaded_file = st.file_uploader(
+            "Upload test dataset (CSV)", 
+            type=['csv'],
+            help="Upload your test dataset or use default if available"
+        )
+        
+        # Load dataset
+        if uploaded_file is not None:
+            test_df = pd.read_csv(uploaded_file)
+            dataset_msg = f"Uploaded dataset: {len(test_df)} samples"
+        else:
+            test_df, dataset_msg = load_test_dataset()
+        
+        if test_df is not None:
+            st.success(dataset_msg)
+            
+            # Show dataset info
+            st.markdown("**Dataset Info:**")
+            col_info1, col_info2, col_info3 = st.columns(3)
+            with col_info1:
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{len(test_df)}</div><div class="metric-label">Total Samples</div></div>', unsafe_allow_html=True)
+            with col_info2:
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{len(test_df.columns)}</div><div class="metric-label">Features</div></div>', unsafe_allow_html=True)
+            with col_info3:
+                # Count samples with valid peaks
+                valid_samples = sum(1 for _, row in test_df.iterrows() 
+                                  if any(row[f'peak{i}_freq'] > 0 for i in range(1, 6)))
+                st.markdown(f'<div class="metric-box"><div class="metric-value">{valid_samples}</div><div class="metric-label">Valid Peaks</div></div>', unsafe_allow_html=True)
+        else:
+            st.error(dataset_msg)
+            st.info("Please upload a test dataset to continue with the analysis.")
+            return
+    
+    with col2:
+        # Dataset preview
+        if test_df is not None:
+            st.markdown("**Dataset Preview:**")
+            st.dataframe(test_df.head(3), use_container_width=True)
+    
+    # Model selection and bulk prediction
+    st.markdown("---")
+    st.subheader("🤖 Bulk Prediction Analysis")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Model path selection
+        model_paths = []
+        
+        # Look for available models
+        possible_paths = [
+            'quantum_simple_nn_20250623_215653.pkl',
+            'quantum-app/quantum_simple_nn_20250623_215653.pkl',
+            'quantum_inverse_model.pkl'
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                model_paths.append(path)
+        
+        if model_paths:
+            selected_model = st.selectbox("Select model for analysis:", model_paths)
+        else:
+            st.error("No valid model files found!")
+            return
+    
+    with col2:
+        # Analysis controls
+        run_analysis = st.button("🚀 Run Full Analysis", use_container_width=True)
+        
+        if run_analysis:
+            st.session_state.run_bulk_analysis = True
+    
+    # Run bulk analysis if requested
+    if run_analysis or st.session_state.get('run_bulk_analysis', False):
+        with st.spinner("Running bulk predictions on test dataset..."):
+            
+            # Progress bar
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            status_text.text("Loading model and preparing features...")
+            progress_bar.progress(20)
+            
+            # Run predictions
+            y_true, y_pred, model_data = run_bulk_predictions(test_df, selected_model)
+            progress_bar.progress(60)
+            
+            if y_true is not None and y_pred is not None:
+                status_text.text("Analyzing prediction errors...")
+                progress_bar.progress(80)
+                
+                # Calculate comprehensive error analysis
+                error_analysis = analyze_errors(y_true, y_pred)
+                progress_bar.progress(100)
+                
+                status_text.text("Analysis complete!")
+                
+                # Store results in session state
+                st.session_state.bulk_results = {
+                    'y_true': y_true,
+                    'y_pred': y_pred,
+                    'error_analysis': error_analysis,
+                    'model_data': model_data,
+                    'test_df': test_df
+                }
+                
+                st.success("✅ Bulk analysis completed successfully!")
+            else:
+                st.error("❌ Failed to run bulk analysis")
+                return
+    
+    # Display results if available
+    if 'bulk_results' in st.session_state:
+        results = st.session_state.bulk_results
+        y_true = results['y_true']
+        y_pred = results['y_pred']
+        error_analysis = results['error_analysis']
+        model_data = results['model_data']
+        
+        # Performance metrics summary
+        st.markdown("---")
+        st.subheader("📊 Performance Summary")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            overall_mae = np.mean(error_analysis['mae_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_mae:.4f}</div><div class="metric-label">Overall MAE</div></div>', unsafe_allow_html=True)
+        
+        with col2:
+            overall_rmse = np.mean(error_analysis['rmse_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_rmse:.4f}</div><div class="metric-label">Overall RMSE</div></div>', unsafe_allow_html=True)
+        
+        with col3:
+            overall_rel_error = np.mean(error_analysis['rel_error_per_sample'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_rel_error:.1f}%</div><div class="metric-label">Avg Rel Error</div></div>', unsafe_allow_html=True)
+        
+        with col4:
+            overall_r2 = np.mean(error_analysis['r2_per_mag'])
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{overall_r2:.4f}</div><div class="metric-label">Avg R²</div></div>', unsafe_allow_html=True)
+        
+        with col5:
+            good_predictions = np.sum(error_analysis['rel_error_per_sample'] < 10)
+            good_percent = good_predictions / len(y_true) * 100
+            st.markdown(f'<div class="metric-box"><div class="metric-value">{good_percent:.1f}%</div><div class="metric-label">< 10% Error</div></div>', unsafe_allow_html=True)
+        
+        # Per-magnitude breakdown
+        st.markdown("**Per-Magnitude Performance:**")
+        
+        mag_col1, mag_col2, mag_col3 = st.columns(3)
+        magnitude_names = ['|a|', '|b|', '|c|']
+        
+        for i, (col, name) in enumerate(zip([mag_col1, mag_col2, mag_col3], magnitude_names)):
+            with col:
+                mae_val = error_analysis['mae_per_mag'][i]
+                r2_val = error_analysis['r2_per_mag'][i]
+                st.markdown(f"""
+                <div class="metric-box">
+                    <div style="font-weight: bold; margin-bottom: 10px;">{name}</div>
+                    <div>MAE: {mae_val:.4f}</div>
+                    <div>R²: {r2_val:.4f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # Error distribution visualizations
+        st.markdown("---")
+        st.subheader("📈 Error Distribution Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # MAE histogram
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(error_analysis['mae_per_sample'], bins=50, alpha=0.7, color='blue', edgecolor='black')
+            ax.axvline(np.mean(error_analysis['mae_per_sample']), color='red', linestyle='--', 
+                      label=f'Mean: {np.mean(error_analysis["mae_per_sample"]):.4f}')
+            ax.axvline(np.median(error_analysis['mae_per_sample']), color='green', linestyle='--', 
+                      label=f'Median: {np.median(error_analysis["mae_per_sample"]):.4f}')
+            ax.set_xlabel('Mean Absolute Error per Sample')
+            ax.set_ylabel('Count')
+            ax.set_title('Distribution of MAE Across Test Samples')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+        
+        with col2:
+            # Relative error histogram
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.hist(error_analysis['rel_error_per_sample'], bins=50, alpha=0.7, color='orange', edgecolor='black')
+            ax.axvline(np.mean(error_analysis['rel_error_per_sample']), color='red', linestyle='--', 
+                      label=f'Mean: {np.mean(error_analysis["rel_error_per_sample"]):.1f}%')
+            ax.axvline(np.median(error_analysis['rel_error_per_sample']), color='green', linestyle='--', 
+                      label=f'Median: {np.median(error_analysis["rel_error_per_sample"]):.1f}%')
+            ax.set_xlabel('Relative Error per Sample (%)')
+            ax.set_ylabel('Count')
+            ax.set_title('Distribution of Relative Error Across Test Samples')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, min(100, np.percentile(error_analysis['rel_error_per_sample'], 95)))
+            st.pyplot(fig)
+        
+        # Scatter plots - Predicted vs True
+        st.markdown("### 🎯 Predicted vs True Magnitude Scatter Plots")
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        for i, (ax, name) in enumerate(zip(axes, magnitude_names)):
+            # Scatter plot
+            ax.scatter(y_true[:, i], y_pred[:, i], alpha=0.5, s=20)
+            
+            # Perfect prediction line
+            min_val = 0
+            max_val = max(y_true[:, i].max(), y_pred[:, i].max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+            
+            # Add error bands
+            ax.fill_between([min_val, max_val], 
+                           [min_val*0.9, max_val*0.9], 
+                           [min_val*1.1, max_val*1.1], 
+                           alpha=0.2, color='gray', label='±10% Error')
+            
+            # Metrics
+            mae = error_analysis['mae_per_mag'][i]
+            r2 = error_analysis['r2_per_mag'][i]
+            
+            ax.set_xlabel(f'True {name}')
+            ax.set_ylabel(f'Predicted {name}')
+            ax.set_title(f'{name}\nMAE={mae:.4f}, R²={r2:.4f}')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            ax.set_xlim(0, max_val * 1.05)
+            ax.set_ylim(0, max_val * 1.05)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        # Performance vs magnitude analysis
+        st.markdown("### 📉 Performance vs Magnitude Analysis")
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Error vs average magnitude
+        avg_mags = error_analysis['avg_true_mag']
+        mae_samples = error_analysis['mae_per_sample']
+        rel_error_samples = error_analysis['rel_error_per_sample']
+        
+        # Bin by magnitude ranges
+        mag_bins = np.linspace(0, avg_mags.max(), 10)
+        bin_centers = (mag_bins[:-1] + mag_bins[1:]) / 2
+        
+        binned_mae = []
+        binned_rel_error = []
+        
+        for i in range(len(mag_bins)-1):
+            mask = (avg_mags >= mag_bins[i]) & (avg_mags < mag_bins[i+1])
+            if np.sum(mask) > 0:
+                binned_mae.append(np.mean(mae_samples[mask]))
+                binned_rel_error.append(np.mean(rel_error_samples[mask]))
+            else:
+                binned_mae.append(np.nan)
+                binned_rel_error.append(np.nan)
+        
+        # Plot MAE vs magnitude
+        ax1.plot(bin_centers, binned_mae, 'bo-', linewidth=2, markersize=8)
+        ax1.set_xlabel('Average True Magnitude |a|, |b|, |c|')
+        ax1.set_ylabel('Mean Absolute Error')
+        ax1.set_title('MAE vs State Magnitude')
+        ax1.grid(True, alpha=0.3)
+        
+        # Add regions
+        ax1.axvspan(0, 0.5, alpha=0.2, color='red', label='High Error Region')
+        ax1.axvspan(0.5, 1.0, alpha=0.2, color='yellow', label='Moderate Error')
+        ax1.axvspan(1.0, avg_mags.max(), alpha=0.2, color='green', label='Low Error Region')
+        ax1.legend()
+        
+        # Plot relative error vs magnitude
+        ax2.plot(bin_centers, binned_rel_error, 'ro-', linewidth=2, markersize=8)
+        ax2.set_xlabel('Average True Magnitude |a|, |b|, |c|')
+        ax2.set_ylabel('Relative Error (%)')
+        ax2.set_title('Relative Error vs State Magnitude')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add regions
+        ax2.axvspan(0, 0.5, alpha=0.2, color='red')
+        ax2.axvspan(0.5, 1.0, alpha=0.2, color='yellow')
+        ax2.axvspan(1.0, avg_mags.max(), alpha=0.2, color='green')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        # Outlier analysis
+        st.markdown("---")
+        st.subheader("🔍 Outlier Analysis")
+        
+        # Find worst and best cases
+        worst_indices = np.argsort(error_analysis['rel_error_per_sample'])[-10:][::-1]
+        best_indices = np.argsort(error_analysis['rel_error_per_sample'])[:10]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**🔴 Worst 10 Predictions:**")
+            worst_data = []
+            for idx in worst_indices:
+                worst_data.append({
+                    'Sample': int(idx),
+                    'Rel Error (%)': f"{error_analysis['rel_error_per_sample'][idx]:.1f}",
+                    'MAE': f"{error_analysis['mae_per_sample'][idx]:.4f}",
+                    'Avg Magnitude': f"{error_analysis['avg_true_mag'][idx]:.3f}"
+                })
+            
+            worst_df = pd.DataFrame(worst_data)
+            st.dataframe(worst_df, use_container_width=True)
+        
+        with col2:
+            st.markdown("**🟢 Best 10 Predictions:**")
+            best_data = []
+            for idx in best_indices:
+                best_data.append({
+                    'Sample': int(idx),
+                    'Rel Error (%)': f"{error_analysis['rel_error_per_sample'][idx]:.1f}",
+                    'MAE': f"{error_analysis['mae_per_sample'][idx]:.4f}",
+                    'Avg Magnitude': f"{error_analysis['avg_true_mag'][idx]:.3f}"
+                })
+            
+            best_df = pd.DataFrame(best_data)
+            st.dataframe(best_df, use_container_width=True)
+        
+        # Statistical summary
+        st.markdown("### 📋 Statistical Summary")
+        
+        percentiles = [50, 75, 90, 95, 99]
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**MAE Percentiles:**")
+            mae_stats = []
+            for p in percentiles:
+                mae_stats.append({
+                    'Percentile': f"{p}th",
+                    'MAE': f"{np.percentile(error_analysis['mae_per_sample'], p):.4f}"
+                })
+            st.dataframe(pd.DataFrame(mae_stats), use_container_width=True)
+        
+        with col2:
+            st.markdown("**Relative Error Percentiles:**")
+            rel_stats = []
+            for p in percentiles:
+                rel_stats.append({
+                    'Percentile': f"{p}th",
+                    'Rel Error (%)': f"{np.percentile(error_analysis['rel_error_per_sample'], p):.1f}"
+                })
+            st.dataframe(pd.DataFrame(rel_stats), use_container_width=True)
+        
+        # Key insights
+        st.markdown("### 💡 Key Insights")
+        
+        insights = []
+        
+        # Performance by magnitude ranges
+        low_mag_mask = error_analysis['avg_true_mag'] < 0.5
+        high_mag_mask = error_analysis['avg_true_mag'] > 1.5
+        
+        if np.sum(low_mag_mask) > 0:
+            low_mag_error = np.mean(error_analysis['rel_error_per_sample'][low_mag_mask])
+            insights.append(f"🔴 Low magnitude states (< 0.5): {low_mag_error:.1f}% average relative error")
+        
+        if np.sum(high_mag_mask) > 0:
+            high_mag_error = np.mean(error_analysis['rel_error_per_sample'][high_mag_mask])
+            insights.append(f"🟢 High magnitude states (> 1.5): {high_mag_error:.1f}% average relative error")
+        
+        # Error distribution
+        excellent_count = np.sum(error_analysis['rel_error_per_sample'] < 5)
+        good_count = np.sum((error_analysis['rel_error_per_sample'] >= 5) & (error_analysis['rel_error_per_sample'] < 10))
+        poor_count = np.sum(error_analysis['rel_error_per_sample'] >= 20)
+        
+        insights.extend([
+            f"🎯 {excellent_count} samples ({excellent_count/len(y_true)*100:.1f}%) have < 5% relative error",
+            f"✅ {good_count} samples ({good_count/len(y_true)*100:.1f}%) have 5-10% relative error",
+            f"⚠️ {poor_count} samples ({poor_count/len(y_true)*100:.1f}%) have > 20% relative error"
+        ])
+        
+        # Best performing magnitude
+        best_mag_idx = np.argmin(error_analysis['mae_per_mag'])
+        worst_mag_idx = np.argmax(error_analysis['mae_per_mag'])
+        
+        insights.extend([
+            f"🏆 Best predicted magnitude: {magnitude_names[best_mag_idx]} (MAE: {error_analysis['mae_per_mag'][best_mag_idx]:.4f})",
+            f"📉 Most challenging magnitude: {magnitude_names[worst_mag_idx]} (MAE: {error_analysis['mae_per_mag'][worst_mag_idx]:.4f})"
+        ])
+        
+        for insight in insights:
+            if "🔴" in insight or "⚠️" in insight or "📉" in insight:
+                st.markdown(f'<div class="error-bad">{insight}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="error-good">{insight}</div>', unsafe_allow_html=True)
+
+# ==========================================
+# WORKFLOW EXPLANATION FUNCTIONS
+# ==========================================
+
+def show_workflow_explanation():
+    """Display the workflow explanation tab"""
+    
+    st.header("🔄 How the Quantum FFT State Analyzer Works")
+    
+    # Overview
+    st.markdown("### 📋 Overview")
+    st.info("""
+    This application demonstrates a quantum inverse problem: recovering quantum state information from 
+    frequency measurements. It combines quantum simulation with machine learning to solve both the 
+    forward problem (state → frequencies) and the inverse problem (frequencies → state).
+    """)
+    
+    # Create columns for side-by-side workflow
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### ➡️ Forward Problem Workflow")
+        st.markdown('<div class="workflow-box">', unsafe_allow_html=True)
+        
+        # Step 1
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 1: Define Quantum State**")
+        st.markdown("Input: Complex amplitudes a, b, c")
+        st.latex(r"|ψ⟩ = a|110000⟩ + b|100100⟩ + c|100001⟩")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 2
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 2: Build Hamiltonian**")
+        st.markdown("- ZZ interactions (k-couplings)")
+        st.markdown("- XX+YY interactions (J-couplings)")
+        st.latex(r"H = \sum_{i,j} k_{ij}Z_iZ_j + J\sum_{⟨i,j⟩}(X_iX_j + Y_iY_j)")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 3
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 3: Time Evolution**")
+        st.markdown("- Solve Schrödinger equation")
+        st.markdown("- Use Runge-Kutta 4th order")
+        st.latex(r"i\hbar\frac{d\rho}{dt} = [H, \rho]")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 4
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 4: Extract Dynamics**")
+        st.markdown("- Monitor qubit 4 probability P₄(t)")
+        st.markdown("- Sample over 50 time units")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 5
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 5: FFT Analysis**")
+        st.markdown("- Apply windowed FFT")
+        st.markdown("- Find peaks using cubic spline")
+        st.markdown("- Sort by amplitude (largest first)")
+        st.markdown("Output: Top 5 frequency peaks")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("### ⬅️ Inverse Problem Workflow")
+        st.markdown('<div class="workflow-box">', unsafe_allow_html=True)
+        
+        # Step 1
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 1: Input FFT Peaks**")
+        st.markdown("Input: 5 frequency peaks (sorted by amplitude)")
+        st.markdown("- Peak frequencies (Hz)")
+        st.markdown("- Peak amplitudes")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 2
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 2: Feature Engineering**")
+        st.markdown("Basic features (10):")
+        st.markdown("- 5 frequencies + 5 amplitudes")
+        st.markdown("Engineered features (5):")
+        st.markdown("- Total power, # peaks, max freq/amp, freq spread")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 3
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 3: Feature Scaling**")
+        st.markdown("- StandardScaler normalization")
+        st.markdown("- Same scaling as training data")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 4
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 4: ML Prediction**")
+        st.markdown("Model options:")
+        st.markdown("- Neural Network (3 layers)")
+        st.markdown("- Random Forest")
+        st.markdown("- Ensemble (weighted average)")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Step 5
+        st.markdown('<div class="workflow-step">', unsafe_allow_html=True)
+        st.markdown("**Step 5: Output Magnitudes**")
+        st.markdown("Output: |a|, |b|, |c|")
+        st.markdown("- Magnitudes only (phase lost)")
+        st.markdown("- Confidence score")
+        st.markdown("- Error metrics if truth known")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # ML Model Details
+    st.markdown("---")
+    st.markdown("### 🤖 Machine Learning Model Details")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("#### Training Data")
+        st.markdown('<div class="ml-feature">', unsafe_allow_html=True)
+        st.markdown("**Dataset Generation:**")
+        st.markdown("- 5000 random quantum states")
+        st.markdown("- Complex amplitudes ∈ [-3, 3]")
+        st.markdown("- 80/20 train/test split")
+        st.markdown("- Full quantum simulation for each")
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("#### Model Architecture")
+        st.markdown('<div class="ml-feature">', unsafe_allow_html=True)
+        st.markdown("**Neural Network:**")
+        st.markdown("- Input: 15 features")
+        st.markdown("- Hidden: [150, 100, 50] neurons")
+        st.markdown("- Output: 3 magnitudes")
+        st.markdown("- Activation: ReLU")
+        st.markdown("- Optimizer: Adam")
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    with col3:
+        st.markdown("#### Performance")
+        st.markdown('<div class="ml-feature">', unsafe_allow_html=True)
+        st.markdown("**Typical Results:**")
+        st.markdown("- Test R² > 0.996")
+        st.markdown("- MAE < 0.025")
+        st.markdown("- Relative error < 3%")
+        st.markdown("- Confidence based on # peaks")
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # ML Training Results
+    st.markdown("---")
+    st.markdown("### 📊 ML Training Results")
+    
+    # Create a nice table for the results
+    results_data = {
+        'Approach': ['Neural Network', 'NN Calibrated', 'Ensemble (Average)', 'Ensemble (Weighted)'],
+        'MAE': [0.0272, 0.0271, 0.0241, 0.0237],
+        'RMSE': [0.0550, 0.0549, 0.0425, 0.0418],
+        'R²': [0.9960, 0.9960, 0.9976, 0.9977],
+        'Rel Error': ['3.21%', '3.20%', '3.04%', '3.00%']
+    }
+    
+    results_df = pd.DataFrame(results_data)
+    
+    # Style the dataframe
+    st.markdown("**Final Model Comparison:**")
+    st.dataframe(
+        results_df.style.highlight_min(subset=['MAE', 'RMSE', 'Rel Error'], color='lightgreen')
+                       .highlight_max(subset=['R²'], color='lightgreen')
+                       .format({'MAE': '{:.4f}', 'RMSE': '{:.4f}', 'R²': '{:.4f}'}),
+        use_container_width=True
+    )
+    
+    st.success("✅ **Best Approach: Ensemble (Weighted)** - Achieves lowest error and highest R²")
+
+# ==========================================
+# MAIN APP SECTION
+# ==========================================
+
+def show_main_app():
+    """Display the main application interface"""
+    
+    # Network diagram
+    with st.container():
+        st.plotly_chart(draw_network_diagram(), use_container_width=True)
+
+    st.markdown("---")
+
+    # Create two columns for forward and inverse problems
+    col1, col2 = st.columns(2)
+
+    # FORWARD PROBLEM (Left Panel)
+    with col1:
+        st.header("➡️ Forward Problem")
+        st.subheader("Quantum State → FFT Peaks")
+        
+        # Lock icon for k-values
+        lock_col1, lock_col2 = st.columns([4, 1])
+        with lock_col2:
+            st.session_state.k_values_locked = st.checkbox("🔒", value=st.session_state.k_values_locked, 
+                                                           help="Lock k-values between panels")
+        
+        # Coupling constants
+        st.markdown("**Coupling Constants:**")
+        k01_forward = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_f")
+        k23_forward = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_f")
+        k45_forward = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_f")
+        j_coupling_forward = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_f")
+        
+        # Initial state info
+        st.markdown("**Initial State:**")
+        st.latex(r"|ψ⟩ = a|110000⟩ + b|100100⟩ + c|100001⟩")
+        
+        # Quantum amplitudes
+        st.markdown("**Quantum Amplitudes:**")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            a_real = st.number_input("a_real", value=0.148, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_real = st.number_input("b_real", value=-2.004, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_real = st.number_input("c_real", value=1.573, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+        with col_b:
+            a_imag = st.number_input("a_imag", value=2.026, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            b_imag = st.number_input("b_imag", value=0.294, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+            c_imag = st.number_input("c_imag", value=-2.555, min_value=-3.0, max_value=3.0, step=0.001, format="%.3f")
+        
+        # Calculate and display magnitudes and phases
+        a_complex = a_real + 1j * a_imag
+        b_complex = b_real + 1j * b_imag
+        c_complex = c_real + 1j * c_imag
+        
+        a_mag = abs(a_complex)
+        b_mag = abs(b_complex)
+        c_mag = abs(c_complex)
+        
+        a_phase = np.angle(a_complex, deg=True)
+        b_phase = np.angle(b_complex, deg=True)
+        c_phase = np.angle(c_complex, deg=True)
+        
+        # Store magnitudes in session state
+        st.session_state.forward_magnitudes = {'a': a_mag, 'b': b_mag, 'c': c_mag}
+        
+        # Display magnitudes and phases
+        st.markdown("**Calculated Values:**")
+        col_mag, col_phase = st.columns(2)
+        with col_mag:
+            st.markdown("**Magnitudes:**")
+            st.markdown(f'<div class="magnitude-display">|a| = {a_mag:.3f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="magnitude-display">|b| = {b_mag:.3f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="magnitude-display">|c| = {c_mag:.3f}</div>', unsafe_allow_html=True)
+        with col_phase:
+            st.markdown("**Phases (degrees):**")
+            st.markdown(f'<div class="phase-display">φ_a = {a_phase:.1f}°</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="phase-display">φ_b = {b_phase:.1f}°</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="phase-display">φ_c = {c_phase:.1f}°</div>', unsafe_allow_html=True)
+        
+        # Simulate button
+        if st.button("🔄 Simulate Dynamics", key="simulate"):
+            with st.spinner("Running quantum simulation..."):
+                # Run actual simulation
+                peaks, probs, times, fft_data = run_quantum_simulation(
+                    a_complex, b_complex, c_complex,
+                    k01_forward, k23_forward, k45_forward, j_coupling_forward
+                )
+                
+                st.session_state.forward_results = {
+                    'peaks': peaks,
+                    'probs': probs,
+                    'times': times,
+                    'fft_data': fft_data,
+                    'success': True
+                }
+        
+        # Results section
+        if st.session_state.forward_results and st.session_state.forward_results['success']:
+            st.markdown("### 📊 Results")
+            st.markdown("**Detected Peaks (sorted by amplitude):**")
+            
+            peaks = st.session_state.forward_results['peaks']
+            if peaks:
+                for i, peak in enumerate(peaks):
+                    if peak['freq'] > 0:  # Only show non-zero peaks
+                        st.write(f"• Peak {i+1}: {float(peak['freq']):.3f} Hz (amp: {float(peak['amp']):.3f})")
+            else:
+                st.write("No significant peaks detected")
+            
+            col_plot1, col_plot2 = st.columns(2)
+            with col_plot1:
+                if st.button("📊 Show FFT Plot", key="fft_plot"):
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    
+                    # Get actual FFT data
+                    freq, mag = st.session_state.forward_results['fft_data']
+                    
+                    ax.plot(freq, mag, 'b-', linewidth=1.5)
+                    
+                    # Mark peaks
+                    for i, peak in enumerate(peaks):
+                        if peak['freq'] > 0:
+                            ax.axvline(peak['freq'], color='red', linestyle='--', alpha=0.5)
+                            ax.plot(peak['freq'], peak['amp'], 'ro', markersize=8)
+                            ax.text(peak['freq'], peak['amp'] + 0.01, f"{i+1}", ha='center', fontsize=8)
+                    
+                    ax.set_xlabel('Frequency (Hz)')
+                    ax.set_ylabel('Magnitude')
+                    ax.set_title('FFT of Q4 (peaks numbered by amplitude rank)')
+                    ax.grid(True, alpha=0.3)
+                    ax.set_xlim(0, 2)
+                    st.pyplot(fig)
+            
+            with col_plot2:
+                if st.button("📈 Show Dynamics", key="dynamics_plot"):
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    probs = st.session_state.forward_results['probs']
+                    times = st.session_state.forward_results['times']
+                    
+                    ax.plot(times, probs[:, 4], 'b-', linewidth=1.5)
+                    ax.set_xlabel('Time')
+                    ax.set_ylabel('P(1)')
+                    ax.set_title('Q4 Dynamics')
+                    ax.grid(True, alpha=0.3)
+                    ax.set_ylim(-0.05, 1.05)
+                    st.pyplot(fig)
+
+    # INVERSE PROBLEM (Right Panel)
+    with col2:
+        st.header("⬅️ Inverse Problem")
+        st.subheader("FFT Peaks → Quantum State")
+        
+        # Coupling constants (synchronized if locked)
+        st.markdown("**Coupling Constants:**")
+        if st.session_state.k_values_locked:
+            k01_inverse = st.number_input("k(0,1)", value=k01_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k01_i", disabled=True)
+            k23_inverse = st.number_input("k(2,3)", value=k23_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k23_i", disabled=True)
+            k45_inverse = st.number_input("k(4,5)", value=k45_forward, min_value=0.0, max_value=3.0, step=0.1, 
+                                         key="k45_i", disabled=True)
+            j_coupling_inverse = st.number_input("J-coupling", value=j_coupling_forward, min_value=0.0, max_value=2.0, 
+                                               step=0.1, key="j_i", disabled=True)
+        else:
+            k01_inverse = st.number_input("k(0,1)", value=0.7, min_value=0.0, max_value=3.0, step=0.1, key="k01_i")
+            k23_inverse = st.number_input("k(2,3)", value=1.0, min_value=0.0, max_value=3.0, step=0.1, key="k23_i")
+            k45_inverse = st.number_input("k(4,5)", value=1.9, min_value=0.0, max_value=3.0, step=0.1, key="k45_i")
+            j_coupling_inverse = st.number_input("J-coupling", value=0.5, min_value=0.0, max_value=2.0, step=0.1, key="j_i")
+        
+        # Important note about peak ordering
+        st.info("ℹ️ **Important**: Peaks should be ordered by amplitude (largest first), not frequency!")
+        
+        # Auto-fill from forward results
+        if st.session_state.forward_results and st.button("↩️ Use Forward Results", key="autofill"):
+            peaks = st.session_state.forward_results['peaks']
+            st.success("Peak values loaded! They are already sorted by amplitude as required.")
+        
+        # FFT Peak inputs
+        st.markdown("**FFT Peak Frequencies (Hz):**")
+        st.markdown("*Enter peaks in order of decreasing amplitude*")
+        col_freq, col_amp = st.columns(2)
+        
+        # Initialize default values
+        default_peaks = []
+        if st.session_state.forward_results:
+            default_peaks = st.session_state.forward_results['peaks']
+        
+        with col_freq:
+            st.markdown("**Frequencies:**")
+            peak_freqs = []
+            for i in range(5):
+                default_freq = float(default_peaks[i]['freq']) if i < len(default_peaks) else 0.0
+                freq = st.number_input(f"Peak {i+1}", value=default_freq, min_value=0.0, max_value=5.0, 
+                                      step=0.001, format="%.3f", key=f"p{i+1}f")
+                peak_freqs.append(freq)
+        
+        with col_amp:
+            st.markdown("**Amplitudes:**")
+            peak_amps = []
+            for i in range(5):
+                default_amp = float(default_peaks[i]['amp']) if i < len(default_peaks) else 0.0
+                # More reasonable maximum based on typical values
+                max_amp = 20.0
+                if default_amp > max_amp:
+                    st.warning(f"Peak {i+1} amplitude {default_amp:.3f} exceeds maximum, capping at {max_amp}")
+                    default_amp = max_amp
+                amp = st.number_input(f"Amp {i+1}", value=default_amp, min_value=0.0, max_value=max_amp, 
+                                     step=0.001, format="%.3f", key=f"p{i+1}a")
+                peak_amps.append(amp)
+        
+        # Model loading options
+        st.markdown("**Model Loading:**")
+        model_option = st.selectbox(
+            "Select model loading method:",
+            ["Local file (quantum_simple_nn_20250623_215653.pkl)",
+             "Download from URL",
+             "Use backup model"]
+        )
+        
+        # Predict button
+        if st.button("🧮 Predict State", key="predict"):
+            with st.spinner("Running ML prediction..."):
+                try:
+                    # Find the best model
+                    model_paths = [
+                        'quantum_simple_nn_20250623_215653.pkl',
+                        'quantum-app/quantum_simple_nn_20250623_215653.pkl',
+                        'quantum_inverse_model.pkl'
+                    ]
+                    
+                    model_path = None
+                    for path in model_paths:
+                        if os.path.exists(path):
+                            model_path = path
+                            break
+                    
+                    if model_path and os.path.exists(model_path):
+                        # Load the model
+                        model_data = joblib.load(model_path)
+                        st.success(f"Model loaded successfully from {model_path}")
+                        
+                        # CRITICAL: Sort peaks by amplitude (descending) to match training!
+                        peak_data = list(zip(peak_freqs, peak_amps))
+                        peak_data_sorted = sorted(peak_data, key=lambda x: x[1], reverse=True)
+                        
+                        # Extract sorted frequencies and amplitudes
+                        sorted_freqs = [p[0] for p in peak_data_sorted]
+                        sorted_amps = [p[1] for p in peak_data_sorted]
+                        
+                        # Show sorting info
+                        if peak_data != peak_data_sorted:
+                            st.warning("⚠️ Peaks were re-sorted by amplitude to match training data format!")
+                            st.write("Sorted order:")
+                            for i, (f, a) in enumerate(peak_data_sorted):
+                                if f > 0:
+                                    st.write(f"  Peak {i+1}: {f:.3f} Hz (amp: {a:.3f})")
+                        
+                        # Check if this is a neural network model with engineered features
+                        if 'feature_cols' in model_data and len(model_data['feature_cols']) > 10:
+                            # This is the neural network model with engineered features
+                            model = model_data['model']
+                            scaler = model_data['scaler']
+                            
+                            # Prepare features EXACTLY as in training
+                            features = []
+                            
+                            # Basic features (sorted frequencies and amplitudes)
+                            for i in range(5):
+                                features.extend([sorted_freqs[i], sorted_amps[i]])
+                            
+                            # Engineered features - must match neuralnetwork.py exactly
+                            total_power = sum(sorted_amps)
+                            n_peaks = sum(1 for f in sorted_freqs if f > 0)
+                            max_freq = max(sorted_freqs)
+                            max_amp = max(sorted_amps)
+                            freq_spread = max(sorted_freqs) - min(sorted_freqs)
+                            
+                            # Add engineered features in the same order as training
+                            features.extend([total_power, n_peaks, max_freq, max_amp, freq_spread])
+                            
+                            # Convert to numpy array and scale
+                            X_test = np.array([features])
+                            X_test_scaled = scaler.transform(X_test)
+                            
+                            # Predict - handle both single model and ensemble
+                            if isinstance(model, dict):
+                                # This is an ensemble
+                                predictions = {}
+                                
+                                # Get predictions from each model
+                                for name, m in model.items():
+                                    if hasattr(m, 'predict'):
+                                        pred = m.predict(X_test_scaled)[0]
+                                        predictions[name] = pred
+                                
+                                # Apply ensemble strategy
+                                approach = model_data.get('approach', 'Ensemble (Weighted)')
+                                
+                                if 'Weighted' in approach:
+                                    # Use training weights
+                                    weights = {'rf': 0.4, 'et': 0.3, 'nn': 0.3}
+                                    y_pred = np.zeros(3)
+                                    total_weight = 0
+                                    for name, pred in predictions.items():
+                                        weight = weights.get(name, 1.0/len(predictions))
+                                        y_pred += pred * weight
+                                        total_weight += weight
+                                    y_pred /= total_weight  # Normalize
+                                else:
+                                    # Simple average
+                                    y_pred = np.mean(list(predictions.values()), axis=0)
+                            else:
+                                # Single model
+                                y_pred = model.predict(X_test_scaled)[0]
+                            
+                            # Apply calibration if available
+                            if model_data.get('calibration_factors'):
+                                cal_factors = model_data['calibration_factors']
+                                for i in range(3):
+                                    y_pred[i] *= cal_factors[i]
+                            
+                            # Model info
+                            model_info = model_data.get('approach', 'Neural Network')
+                            
+                        else:
+                            # Original model without engineered features
+                            model = model_data['model']
+                            scaler = model_data['scaler']
+                            
+                            # Prepare features (sorted frequencies and amplitudes interleaved)
+                            features = []
+                            for i in range(5):
+                                features.extend([sorted_freqs[i], sorted_amps[i]])
+                            
+                            X_test = np.array([features])
+                            X_test_scaled = scaler.transform(X_test)
+                            
+                            # Predict
+                            y_pred = model.predict(X_test_scaled)[0]
+                            
+                            # Model info
+                            model_info = model_data.get('model_type', 'Unknown')
+                        
+                        # Calculate confidence
+                        non_zero_peaks = sum(1 for f in sorted_freqs if f > 0)
+                        confidence = min(95, 50 + non_zero_peaks * 9)
+                        
+                        st.session_state.inverse_results = {
+                            'a_mag': float(y_pred[0]),
+                            'b_mag': float(y_pred[1]),
+                            'c_mag': float(y_pred[2]),
+                            'confidence': confidence,
+                            'success': True,
+                            'model_info': model_info,
+                            'model_file': model_path
+                        }
+                        
+                        st.success(f"✅ Prediction complete using {model_info}")
+                        
+                    else:
+                        st.error("No model file found!")
+                        st.info("Please ensure the model file exists.")
+                        
+                except Exception as e:
+                    st.error(f"Error in prediction: {str(e)}")
+                    import traceback
+                    st.text(traceback.format_exc())
+        
+        # Results section
+        if st.session_state.inverse_results and st.session_state.inverse_results['success']:
+            st.markdown("### 📊 Results")
+            st.markdown("**Predicted State Magnitudes:**")
+            
+            # Show predicted magnitudes with comparison to forward values
+            pred_a = st.session_state.inverse_results['a_mag']
+            pred_b = st.session_state.inverse_results['b_mag']
+            pred_c = st.session_state.inverse_results['c_mag']
+            
+            if st.session_state.forward_magnitudes:
+                true_a = st.session_state.forward_magnitudes['a']
+                true_b = st.session_state.forward_magnitudes['b']
+                true_c = st.session_state.forward_magnitudes['c']
+                
+                # Display with comparison
+                st.markdown("**Magnitude Comparison:**")
+                col_pred, col_true, col_diff = st.columns(3)
+                
+                with col_pred:
+                    st.markdown("**Predicted:**")
+                    st.write(f"|a| = {pred_a:.3f}")
+                    st.write(f"|b| = {pred_b:.3f}")
+                    st.write(f"|c| = {pred_c:.3f}")
+                
+                with col_true:
+                    st.markdown("**True (Forward):**")
+                    st.write(f"|a| = {true_a:.3f}")
+                    st.write(f"|b| = {true_b:.3f}")
+                    st.write(f"|c| = {true_c:.3f}")
+                
+                with col_diff:
+                    st.markdown("**Error:**")
+                    st.write(f"Δ|a| = {abs(pred_a - true_a):.3f}")
+                    st.write(f"Δ|b| = {abs(pred_b - true_b):.3f}")
+                    st.write(f"Δ|c| = {abs(pred_c - true_c):.3f}")
+                
+                # Calculate relative errors
+                rel_error_a = abs(pred_a - true_a) / true_a * 100 if true_a > 0 else 0
+                rel_error_b = abs(pred_b - true_b) / true_b * 100 if true_b > 0 else 0
+                rel_error_c = abs(pred_c - true_c) / true_c * 100 if true_c > 0 else 0
+                avg_rel_error = (rel_error_a + rel_error_b + rel_error_c) / 3
+                
+                st.markdown(f"**Average Relative Error:** {avg_rel_error:.1f}%")
+                
+                # Show improvement message if error is now low
+                if avg_rel_error < 10:
+                    st.success("✅ Excellent prediction accuracy!")
+                elif avg_rel_error < 20:
+                    st.info("✓ Good prediction accuracy")
+            else:
+                # Just show predictions if no forward values
+                st.write(f"|a| = {pred_a:.3f}")
+                st.write(f"|b| = {pred_b:.3f}")
+                st.write(f"|c| = {pred_c:.3f}")
+            
+            st.write("")
+            st.write(f"**Model Confidence:** {st.session_state.inverse_results['confidence']}%")
+            
+            # Note about phase information
+            st.info("ℹ️ Note: The ML model predicts only magnitudes |a|, |b|, |c|. "
+                    "Phase information cannot be recovered from FFT peaks alone due to the "
+                    "loss of phase information in the power spectrum.")
+            
+            if st.button("📊 Show Comparison Plots", key="comparison"):
+                # Create comparison plots
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+                
+                # 1. Bar chart comparing magnitudes
+                if st.session_state.forward_magnitudes:
+                    labels = ['|a|', '|b|', '|c|']
+                    predicted = [pred_a, pred_b, pred_c]
+                    true_vals = [true_a, true_b, true_c]
+                    
+                    x = np.arange(len(labels))
+                    width = 0.35
+                    
+                    ax1.bar(x - width/2, true_vals, width, label='True', color='blue', alpha=0.7)
+                    ax1.bar(x + width/2, predicted, width, label='Predicted', color='green', alpha=0.7)
+                    ax1.set_ylabel('Magnitude')
+                    ax1.set_title('Magnitude Comparison')
+                    ax1.set_xticks(x)
+                    ax1.set_xticklabels(labels)
+                    ax1.legend()
+                    ax1.grid(True, alpha=0.3)
+                else:
+                    # Just show predicted if no true values
+                    labels = ['|a|', '|b|', '|c|']
+                    predicted = [pred_a, pred_b, pred_c]
+                    ax1.bar(labels, predicted, color=['blue', 'green', 'red'])
+                    ax1.set_ylabel('Magnitude')
+                    ax1.set_title('Predicted State Magnitudes')
+                    ax1.set_ylim(0, max(predicted) * 1.2)
+                
+                # 2. Radar plot for state visualization
+                categories = ['|a|', '|b|', '|c|']
+                angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+                angles += angles[:1]  # Complete the circle
+                
+                predicted_radar = [pred_a, pred_b, pred_c]
+                predicted_radar += predicted_radar[:1]
+                
+                ax2 = plt.subplot(133, projection='polar')
+                ax2.plot(angles, predicted_radar, 'o-', linewidth=2, label='Predicted', color='green')
+                ax2.fill(angles, predicted_radar, alpha=0.25, color='green')
+                
+                if st.session_state.forward_magnitudes:
+                    true_radar = [true_a, true_b, true_c]
+                    true_radar += true_radar[:1]
+                    ax2.plot(angles, true_radar, 'o-', linewidth=2, label='True', color='blue')
+                    ax2.fill(angles, true_radar, alpha=0.25, color='blue')
+                
+                ax2.set_xticks(angles[:-1])
+                ax2.set_xticklabels(categories)
+                ax2.set_title('State Magnitude Profile')
+                ax2.legend()
+                
+                # 3. Confidence visualization
+                ax3.pie([st.session_state.inverse_results['confidence'], 
+                        100 - st.session_state.inverse_results['confidence']], 
+                       labels=['Confident', 'Uncertain'],
+                       colors=['green', 'lightgray'],
+                       startangle=90)
+                ax3.set_title('Prediction Confidence')
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+
+# ==========================================
+# STAR SENSOR TAB
+# ==========================================
+
+def show_star_sensor_tab():
+    """Display the 6-Qubit Star Sensor tab"""
+    st.header("🔬 Quantum Sensor (6-Qubit Star)")
+    
+    # Introduction
+    st.markdown("""
+    <div class="sensor-info">
+    This model simulates a central <strong>probe qubit (0)</strong> connected to five outer <strong>memory qubits (1-5)</strong>.
+    We initialize the memory qubits in a complex superposition state and observe how their influence affects the dynamics 
+    of the single probe qubit. The goal is to see if the probe's dynamics contain enough information to distinguish 
+    between different memory states.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    controls_col, results_col = st.columns([1, 2])
+    
+    with controls_col:
+        st.subheader("Controls")
+        n_qubits = 6
+        st.info(f"System size is fixed at **{n_qubits} qubits**.")
+        
+        j_strength = st.slider("J-Coupling (Probe-Memory)", 0.0, 2.0, 1.0, 0.1, key="j_star")
+        k_strength = st.slider("k-Coupling (Probe-Memory)", 0.0, 2.0, 0.5, 0.1, key="k_star")
+        
+        st.markdown("---")
+        st.markdown("**Initial Memory State**")
+        st.markdown("The probe qubit (0) starts in state $|1\\rangle$. Select the initial state for the 5 memory qubits (1-5):")
+        
+        mem_state_type = st.selectbox("Select Memory State:", 
+            ("W-State", "Equal Superposition", "GHZ-State", "Product State", "Random Entangled"))
+        
+        # Dynamic explanation of the selected state
+        with st.expander("Learn more about this state"):
+            if mem_state_type == "W-State":
+                st.markdown("**Type:** Entangled State")
+                st.markdown("""
+                    The W-state is a specific class of multipartite entangled state. It represents a **single excitation** 
+                    shared equally across all five memory qubits. The fates of the qubits are linked: if you measure one 
+                    memory qubit and find it in the $|1\\rangle$ state, you know with certainty that all others are in 
+                    the $|0\\rangle$ state.
+                """)
+                st.latex(r"|\psi_{W}\rangle_M = \frac{1}{\sqrt{5}} \left( |10000\rangle + |01000\rangle + |00100\rangle + |00010\rangle + |00001\rangle \right)")
+            
+            elif mem_state_type == "Equal Superposition":
+                st.markdown("**Type:** Separable (Non-Entangled) State")
+                st.markdown("""
+                    This is a simple product state where each memory qubit is **independently** placed in an equal 
+                    superposition of $|0\\rangle$ and $|1\\rangle$. The state of one memory qubit has no correlation 
+                    with any other. It represents a "busier" state that includes all $2^5=32$ possible basis states 
+                    of the memory system.
+                """)
+                st.latex(r"|\psi_{EQ}\rangle_M = \left(\frac{|0\rangle+|1\rangle}{\sqrt{2}}\right)^{\otimes 5} = \frac{1}{\sqrt{32}}\sum_{i=0}^{31} |i\rangle_M")
+            
+            elif mem_state_type == "GHZ-State":
+                st.markdown("**Type:** Maximally Entangled State")
+                st.markdown("""
+                    The GHZ (Greenberger-Horne-Zeilinger) state is a superposition of all qubits being in $|0\\rangle$ 
+                    or all in $|1\\rangle$. This creates maximal entanglement where measuring any single qubit immediately 
+                    determines the state of all others.
+                """)
+                st.latex(r"|\psi_{GHZ}\rangle_M = \frac{1}{\sqrt{2}} \left( |00000\rangle + |11111\rangle \right)")
+            
+            elif mem_state_type == "Product State":
+                st.markdown("**Type:** Separable State (No Entanglement)")
+                st.markdown("""
+                    All memory qubits are initialized in the $|0\\rangle$ state. This serves as a baseline case with 
+                    no quantum correlations between the memory qubits.
+                """)
+                st.latex(r"|\psi_{PROD}\rangle_M = |00000\rangle")
+            
+            elif mem_state_type == "Random Entangled":
+                st.markdown("**Type:** Random Entangled State")
+                st.markdown("""
+                    A randomly generated entangled state of the 5 memory qubits. This allows exploration of generic 
+                    quantum correlations beyond the specific structured states.
+                """)
+        
+        run_button = st.button("🚀 Run Star Simulation", key="run_star")
+    
+    if run_button:
+        with st.spinner("Preparing and running simulation..."):
+            # 1. Define Topology
+            j_couplings = {(0, i): j_strength for i in range(1, n_qubits)}
+            k_couplings = {(0, i): k_strength for i in range(1, n_qubits)}
+            
+            # 2. Get Basis and State-to-Index Map
+            basis, s_to_idx = get_full_basis(n_qubits)
+            psi0 = np.zeros(len(basis), dtype=complex)
+            
+            # 3. Create Initial State
+            if mem_state_type == "W-State":
+                # Superposition of states where probe=1 and one memory qubit=1
+                for i in range(1, n_qubits):
+                    state_list = [0] * n_qubits
+                    state_list[0] = 1  # Probe is in |1>
+                    state_list[i] = 1  # One memory qubit is in |1>
+                    idx = s_to_idx[tuple(state_list)]
+                    psi0[idx] = 1.0
+            
+            elif mem_state_type == "Equal Superposition":
+                # Probe=1, memory in equal superposition of all its basis states
+                for state in basis:
+                    if state[0] == 1:
+                        psi0[s_to_idx[state]] = 1.0
+            
+            elif mem_state_type == "GHZ-State":
+                # Probe=1, memory in GHZ state
+                state1 = (1, 0, 0, 0, 0, 0)  # Probe=1, all memory=0
+                state2 = (1, 1, 1, 1, 1, 1)  # Probe=1, all memory=1
+                psi0[s_to_idx[state1]] = 1.0
+                psi0[s_to_idx[state2]] = 1.0
+            
+            elif mem_state_type == "Product State":
+                # Probe=1, all memory=0
+                state = (1, 0, 0, 0, 0, 0)
+                psi0[s_to_idx[state]] = 1.0
+            
+            elif mem_state_type == "Random Entangled":
+                # Random state with probe=1
+                for state in basis:
+                    if state[0] == 1:
+                        psi0[s_to_idx[state]] = np.random.randn() + 1j * np.random.randn()
+            
+            psi0 /= np.linalg.norm(psi0)
+            
+            # 4. Generate Hamiltonian and Run
+            H = generate_hamiltonian_general(basis, s_to_idx, j_couplings, k_couplings)
+            times, probs, fft_data = run_generalized_simulation(n_qubits, psi0, H, monitored_qubit=0)
+            
+            # 5. Store results
+            st.session_state.star_results = {
+                "times": times, "probs": probs, "fft_data": fft_data,
+                "j": j_couplings, "k": k_couplings, "state_type": mem_state_type
+            }
+    
+    with results_col:
+        st.subheader("Results")
+        if 'star_results' in st.session_state and st.session_state.star_results is not None:
+            res = st.session_state.star_results
+            
+            # Show topology
+            st.plotly_chart(draw_star_topology(6, res['j'], res['k']), use_container_width=True)
+            
+            # Create two columns for plots
+            plot_col1, plot_col2 = st.columns(2)
+            
+            with plot_col1:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(res['times'], res['probs'], 'b-', linewidth=1.5)
+                ax.set_title(f"Probe Qubit Dynamics\n(Memory: {res['state_type']})")
+                ax.set_xlabel("Time")
+                ax.set_ylabel("P(1)")
+                ax.grid(True, alpha=0.3)
+                ax.set_ylim(-0.05, 1.05)
+                st.pyplot(fig)
+            
+            with plot_col2:
+                freq, mag = res['fft_data']
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(freq, mag, 'r-', linewidth=1.5)
+                ax.set_title("FFT of Probe Qubit")
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("Magnitude")
+                ax.grid(True, alpha=0.3)
+                ax.set_xlim(left=0, right=min(10, freq.max() if freq.any() else 10))
+                
+                # Find and mark peaks
+                from scipy.signal import find_peaks
+                peaks, _ = find_peaks(mag, height=0.1*np.max(mag))
+                if len(peaks) > 0:
+                    ax.plot(freq[peaks], mag[peaks], 'go', markersize=8)
+                    for peak in peaks[:5]:  # Show first 5 peaks
+                        ax.annotate(f'{freq[peak]:.2f} Hz', 
+                                   xy=(freq[peak], mag[peak]), 
+                                   xytext=(5, 5), 
+                                   textcoords='offset points',
+                                   fontsize=8)
+                
+                st.pyplot(fig)
+            
+            # Analysis summary
+            st.markdown("### 📊 Analysis Summary")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                avg_prob = np.mean(res['probs'])
+                st.metric("Average P(1)", f"{avg_prob:.3f}")
+            
+            with col2:
+                oscillation_amp = np.max(res['probs']) - np.min(res['probs'])
+                st.metric("Oscillation Amplitude", f"{oscillation_amp:.3f}")
+            
+            with col3:
+                if len(peaks) > 0:
+                    dominant_freq = freq[peaks[np.argmax(mag[peaks])]]
+                    st.metric("Dominant Frequency", f"{dominant_freq:.2f} Hz")
+                else:
+                    st.metric("Dominant Frequency", "N/A")
+            
+            # Insights
+            st.markdown("### 💡 Insights")
+            if res['state_type'] == "W-State":
+                st.info("The W-state creates distinct oscillation patterns due to the shared single excitation among memory qubits.")
+            elif res['state_type'] == "Equal Superposition":
+                st.info("The equal superposition state shows complex dynamics due to contributions from all possible memory configurations.")
+            elif res['state_type'] == "GHZ-State":
+                st.info("The GHZ state's maximal entanglement creates unique interference patterns in the probe dynamics.")
+            elif res['state_type'] == "Product State":
+                st.info("The product state serves as a baseline with minimal quantum correlations affecting the probe.")
+            elif res['state_type'] == "Random Entangled":
+                st.info("Random entangled states can produce unpredictable but potentially information-rich dynamics.")
+        
+        else:
+            st.info("Click 'Run Star Simulation' to see results.")
+
+# ==========================================
+# STREAMLIT APP MAIN STRUCTURE
+# ==========================================
+
+# Initialize session state
+if 'k_values_locked' not in st.session_state:
+    st.session_state.k_values_locked = True
+if 'forward_results' not in st.session_state:
+    st.session_state.forward_results = None
+if 'inverse_results' not in st.session_state:
+    st.session_state.inverse_results = None
+if 'forward_magnitudes' not in st.session_state:
+    st.session_state.forward_magnitudes = None
+if 'run_bulk_analysis' not in st.session_state:
+    st.session_state.run_bulk_analysis = False
+if 'star_results' not in st.session_state:
+    st.session_state.star_results = None
+
+# Title and description
+st.title("🔬 Quantum FFT State Analyzer")
+st.markdown("**Enhanced Version** with Quantum Sensor Simulation")
+
+# Create tabs - UPDATED with new tab
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 Main Application", 
+    "📈 Test Performance", 
+    "🔬 Quantum Sensor",
+    "🔄 How It Works"
+])
+
+with tab1:
+    show_main_app()
+    
+    # Status bar
+    st.markdown("---")
+    status_col1, status_col2 = st.columns([3, 1])
+    with status_col1:
+        # Check local model file
+        model_file = 'quantum_simple_nn_20250623_215653.pkl'
+        if os.path.exists(model_file):
+            is_valid, msg = check_model_file(model_file)
+            if is_valid:
+                st.success("Status: Ready | Model file found and valid ✓")
+            else:
+                st.warning(f"Status: Model issue | {msg}")
+        else:
+            st.warning("Status: Limited | Model file not found - see sidebar for solutions")
+    with status_col2:
+        st.info(f"k-values {'locked 🔒' if st.session_state.k_values_locked else 'unlocked 🔓'}")
+
+with tab2:
+    show_test_performance_analysis()
+
+with tab3:
+    show_star_sensor_tab()
+
+with tab4:
+    show_workflow_explanation()
+
+# Sidebar with instructions
+with st.sidebar:
+    st.header("📖 Instructions & Features")
+    
+    with st.expander("⚡ Quick Start", expanded=True):
+        st.markdown("""
+        ### 🎯 Main App
+        - Forward/inverse quantum problem
+        - Real-time quantum simulation
+        
+        ### 📈 Test Analysis  
+        - Upload test dataset
+        - Run bulk predictions
+        - Comprehensive error analysis
+        
+        ### 🔬 Quantum Sensor (NEW!)
+        - **6-qubit star topology**
+        - **Central probe qubit**
+        - **5 memory qubits**
+        - **Multiple initial states**
+        - **Real-time dynamics**
+        
+        ### 🔄 How It Works
+        - Detailed workflow
+        - Technical implementation
+        """)
+    
+    with st.expander("🔬 Quantum Sensor Features"):
+        st.markdown("""
+        **Available Memory States:**
+        - W-State (shared excitation)
+        - Equal Superposition
+        - GHZ-State (maximal entanglement)
+        - Product State (baseline)
+        - Random Entangled
+        
+        **Adjustable Parameters:**
+        - J-coupling strength (XX+YY)
+        - k-coupling strength (ZZ)
+        
+        **Analysis:**
+        - Probe qubit dynamics
+        - FFT spectrum analysis
+        - Peak detection
+        - Oscillation metrics
+        """)
+    
+    with st.expander("📊 Papers & References"):
+        st.markdown("""
+        **Quantum Inverse Problems:**
+        - Cao et al., "Neural networks for quantum inverse problems" (2022)
+        - Burgarth et al., "Coupling strength estimation for spin chains" (2008)
+        
+        **Quantum Sensors:**
+        - Star topology for quantum sensing
+        - Probe-memory qubit interactions
+        - Information extraction via restricted access
+        """)
+    
+    with st.expander("⚠️ Important Notes"):
+        st.markdown("""
+        - Peak ordering is CRITICAL for inverse problem
+        - Star sensor simulations are computationally intensive
+        - Different memory states produce distinct signatures
+        - Results are cached for performance
+        """)
