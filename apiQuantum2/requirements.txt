@@ -1,1 +1,9 @@
-python-3.9.x
+streamlit
+numpy
+pandas
+matplotlib
+plotly
+joblib
+scikit-learn
+scipy
+requests
